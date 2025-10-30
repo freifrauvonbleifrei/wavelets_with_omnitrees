@@ -125,7 +125,10 @@ def plot_2d_image(
     coefficients: Sequence[np.float32],
 ):
     maximum_level = discretization.descriptor.get_maximum_level()
-    resampled_array: npt.NDArray = np.ndarray(shape=2**maximum_level)
+    maximum_level = maximum_level.astype(np.int64)
+    resampled_array: npt.NDArray = np.ndarray(
+        shape=(2 ** maximum_level[0], 2 ** maximum_level[1])
+    )
     very_small_number = 1e-12
     for x, y in product(
         range(0, 2 ** maximum_level[0]), range(0, 2 ** maximum_level[1])
@@ -140,7 +143,7 @@ def plot_2d_image(
 
     plt.imshow(
         resampled_array,
-        cmap="Greys",  # vmin=0., vmax=1.0
+        cmap="Greys", vmin=0., vmax=1.0
     )
     plt.show()
 
@@ -220,7 +223,9 @@ if __name__ == "__main__":
     )
 
     # reorder input data to Z order
-    ordered_input_coefficients: list[float] = [None] * ic(len(discretization))
+    ordered_input_coefficients: npt.NDArray[np.float32] = np.zeros(
+        shape=(len(discretization)), dtype=np.float32
+    )
     for morton_index in range(len(ordered_input_coefficients)):
         assert base_resolution_level[0] == base_resolution_level[1]
         multidim_index = morton_to_multidim(
@@ -230,7 +235,9 @@ if __name__ == "__main__":
             multidim_index[1], multidim_index[0]
         ]
 
-    ordered_input_coefficients_2: list[float] = [None] * len(discretization)  # type: ignore
+    ordered_input_coefficients_2: npt.NDArray[np.float32] = np.empty_like(
+        ordered_input_coefficients
+    )
     for box_index, (level, multidim_index) in enumerate(
         discretization.get_all_boxes_level_indices()
     ):
