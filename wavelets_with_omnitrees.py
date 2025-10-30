@@ -4,6 +4,7 @@ import bitarray as ba
 import bitarray.util
 from functools import lru_cache
 import matplotlib.pyplot as plt
+import math
 import numpy as np
 import numpy.typing as npt
 from icecream import ic
@@ -215,7 +216,7 @@ if __name__ == "__main__":
         dimensionality, base_resolution_level
     )
     discretization = dyada.discretization.Discretization(
-        linearization=dyada.linearization.MortonOrderLinearization,
+        linearization=dyada.linearization.MortonOrderLinearization(),
         descriptor=uniform_descriptor,
     )
 
@@ -223,15 +224,13 @@ if __name__ == "__main__":
     for box_index, (level, multidim_index) in enumerate(
         discretization.get_all_boxes_level_indices()
     ):
-        # assert all(level == base_resolution_level)
+        # TODO this loop is toooo sloooow
         ordered_input_coefficients_2[box_index] = data[tuple(multidim_index)]
+
     assert None not in ordered_input_coefficients_2
     initial_length = len(ordered_input_coefficients_2)
 
     # show the original image
-    # plt.imshow(data[(slice(0, 2**base_resolution_level[0]), slice(0, 2**base_resolution_level[1]))], cmap="Greys")
-    # plt.show()
-    ic(ordered_input_coefficients_2)
     plot_2d_image(discretization, ordered_input_coefficients_2)
     ordered_input_coefficients = ordered_input_coefficients_2
 
@@ -241,7 +240,7 @@ if __name__ == "__main__":
         discretization,
         ordered_input_coefficients,  # type: ignore
     )
-    ic(coefficients)
+    ic(len(coefficients))
     assert all(len(c) > 0 for c in coefficients)
     num_dimensions = discretization.descriptor.get_num_dimensions()
 
@@ -264,16 +263,60 @@ if __name__ == "__main__":
                 continue
             if all(d == 0.0 for d in coefficients[descriptor_index][1:]):
                 p.plan_coarsening(
-                    children_indices,
+                    descriptor_index,
                     discretization.descriptor[descriptor_index],
-                    indices_are_box_indices=False,
                 )
+                break
+            else:
+                # TODO needs dyada.linearization if not Z order
+                for d_i in range(num_dimensions):
+                    # translate the hierarchical function index
+                    # into which refinements are involved in the hierarchical coefficient
+                    hierarchical_coefficent_indices = get_numbers_with_ith_bit_set(
+                        d_i, num_dimensions
+                    )
+                    if all(
+                        coefficients[descriptor_index][hierarchical_index] == 0.0
+                        for hierarchical_index in hierarchical_coefficent_indices
+                    ) and (len(p._planned_refinements) == 0):
+                        one_d_refinement = get_one_d_refinement(d_i, num_dimensions)
+                        for number_with_ith_bit_set in get_numbers_with_ith_bit_set(
+                            d_i, num_dimensions
+                        ):
+                            upper_neighbor = number_with_ith_bit_set
+                            lower_neighbor = upper_neighbor - 2 ** (d_i)
+                            p.plan_coarsening(
+                                descriptor_index,
+                                one_d_refinement,
+                            )
+                            break
         if len(p._planned_refinements) == 0:
+            # nothing more to compress
             break
-        planned_refinements = dict(p._planned_refinements)
+        planned_refinements = p._planned_refinements
+        new_descriptor, mapping = p.apply_refinements(
+            track_mapping="patches"
+        )  # TODO allow combining independent refinements
 
-        new_descriptor, mapping = p.apply_refinements(track_mapping="patches")
-        # apply mapping to coefficients:
+        dyada.descriptor.validate_descriptor(new_descriptor)
+        new_descriptor, normalization_mapping, num_rounds = (
+            dyada.refinement.normalize_discretization(
+                dyada.discretization.Discretization(
+                    discretization._linearization, new_descriptor
+                ),
+                track_mapping="patches",
+            )
+        )
+        dyada.descriptor.validate_descriptor(new_descriptor)
+        new_discretization = dyada.discretization.Discretization(
+            discretization._linearization, new_descriptor
+        )
+        assert num_rounds < 2
+        try:
+            mapping = dyada.refinement.merge_mappings(mapping, normalization_mapping)
+        except Exception as e:
+            ic(mapping, normalization_mapping)
+            raise e
         new_coefficients = {}
         for key, value in sorted(mapping.items(), reverse=True):
             assert len(value) == 1
@@ -287,7 +330,6 @@ if __name__ == "__main__":
                     if planned_refinements[key][d_i] < 0
                 )
                 hierarchical_coefficent_indices_to_delete: set[int] = set()
-                ic(key, hierarchical_coefficent_indices_to_delete)
                 for refined_dimension in negative_refined_at:
                     hierarchical_coefficent_indices_to_delete.update(
                         get_numbers_with_ith_bit_set(
@@ -298,11 +340,10 @@ if __name__ == "__main__":
                     arr=new_coefficients[value[0]],
                     obj=list(hierarchical_coefficent_indices_to_delete),
                 )
-
+        dyada.descriptor.validate_descriptor(new_descriptor)  # TODO remove
         discretization = dyada.discretization.Discretization(
             discretization._linearization, new_descriptor
         )
-        ic(new_coefficients)
         coefficients = new_coefficients
 
     # validate by showing the image again
