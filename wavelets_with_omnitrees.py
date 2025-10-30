@@ -157,21 +157,8 @@ def get_numbers_with_ith_bit_set(i_set_bit_index: int, bit_length: int) -> set[i
     return numbers
 
 
-def int_to_amm_location_codes_to_coordinates(
-    int_index, bit_length_per_dimension, dimensionality
-):
-    int_as_bitarray = bitarray.util.int2ba(
-        int_index, length=bit_length_per_dimension * dimensionality
-    )
-    very_small_number = 1e-8
-    return reversed(
-        [
-            bitarray.util.ba2int(int_as_bitarray[mask_start::dimensionality])
-            / 2.0**bit_length_per_dimension
-            + very_small_number
-            for mask_start in range(dimensionality)
-        ]
-    )
+def get_set_bitarray_indices(bits: ba.bitarray) -> set[int]:
+    return {i for i, bit in enumerate(reversed(bits)) if bit}
 
 
 @lru_cache(maxsize=None)
@@ -269,7 +256,10 @@ if __name__ == "__main__":
                 break
             else:
                 # TODO needs dyada.linearization if not Z order
-                for d_i in range(num_dimensions):
+                refined_dimensions = get_set_bitarray_indices(
+                    discretization.descriptor[descriptor_index]
+                )
+                for d_i in refined_dimensions:
                     # translate the hierarchical function index
                     # into which refinements are involved in the hierarchical coefficient
                     hierarchical_coefficent_indices = get_numbers_with_ith_bit_set(
@@ -280,16 +270,11 @@ if __name__ == "__main__":
                         for hierarchical_index in hierarchical_coefficent_indices
                     ) and (len(p._planned_refinements) == 0):
                         one_d_refinement = get_one_d_refinement(d_i, num_dimensions)
-                        for number_with_ith_bit_set in get_numbers_with_ith_bit_set(
-                            d_i, num_dimensions
-                        ):
-                            upper_neighbor = number_with_ith_bit_set
-                            lower_neighbor = upper_neighbor - 2 ** (d_i)
-                            p.plan_coarsening(
-                                descriptor_index,
-                                one_d_refinement,
-                            )
-                            break
+                        p.plan_coarsening(
+                            descriptor_index,
+                            one_d_refinement,
+                        )
+                        break
         if len(p._planned_refinements) == 0:
             # nothing more to compress
             break
@@ -344,14 +329,16 @@ if __name__ == "__main__":
         discretization = dyada.discretization.Discretization(
             discretization._linearization, new_descriptor
         )
+        assert len(discretization.descriptor) == len(new_coefficients)
         coefficients = new_coefficients
 
     # validate by showing the image again
     scaling_coefficients = [
         coefficients[index][0]
         for index in range(len(coefficients))
-        if len(coefficients[index]) == 1
+        if discretization.descriptor.is_box(index)
     ]
+    assert len(scaling_coefficients) == len(discretization)
     plot_2d_image(discretization, scaling_coefficients)
     ic(initial_length, len(scaling_coefficients))
 
