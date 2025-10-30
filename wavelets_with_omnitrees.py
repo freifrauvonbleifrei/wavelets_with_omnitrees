@@ -168,6 +168,18 @@ def get_one_d_refinement(i_set_bit_index: int, bit_length: int) -> ba.bitarray:
     return one_d_refinement
 
 
+def morton_to_multidim(
+    morton_index: int, num_dimensions: int = 2, level: int = 6
+) -> tuple[int, ...]:
+    index_as_bitarray = bitarray.util.int2ba(
+        morton_index, length=level * num_dimensions
+    )
+    return tuple(
+        bitarray.util.ba2int(index_as_bitarray[mask_start::num_dimensions])
+        for mask_start in range(num_dimensions)
+    )
+
+
 if __name__ == "__main__":
     parser = arg.ArgumentParser()
     parser.add_argument(
@@ -207,19 +219,35 @@ if __name__ == "__main__":
         descriptor=uniform_descriptor,
     )
 
+    # reorder input data to Z order
+    ordered_input_coefficients: list[float] = [None] * ic(len(discretization))
+    for morton_index in range(len(ordered_input_coefficients)):
+        assert base_resolution_level[0] == base_resolution_level[1]
+        multidim_index = morton_to_multidim(
+            morton_index, level=base_resolution_level[0]
+        )
+        ordered_input_coefficients[morton_index] = data[
+            multidim_index[1], multidim_index[0]
+        ]
+
     ordered_input_coefficients_2: list[float] = [None] * len(discretization)  # type: ignore
     for box_index, (level, multidim_index) in enumerate(
         discretization.get_all_boxes_level_indices()
     ):
-        # TODO this loop is toooo sloooow
+        # this loop would be too slow
         ordered_input_coefficients_2[box_index] = data[tuple(multidim_index)]
+        assert (
+            ordered_input_coefficients[box_index]
+            == ordered_input_coefficients_2[box_index]
+        )
+        if box_index > 32:
+            break
 
-    assert None not in ordered_input_coefficients_2
-    initial_length = len(ordered_input_coefficients_2)
+    assert None not in ordered_input_coefficients
+    initial_length = len(ordered_input_coefficients)
 
     # show the original image
-    plot_2d_image(discretization, ordered_input_coefficients_2)
-    ordered_input_coefficients = ordered_input_coefficients_2
+    plot_2d_image(discretization, ordered_input_coefficients)
 
     # # transform to Haar wavelet data
     ic("start transforming")
