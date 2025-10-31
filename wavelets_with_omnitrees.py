@@ -129,22 +129,20 @@ def plot_2d_image(
     resampled_array: npt.NDArray = np.ndarray(
         shape=(2 ** maximum_level[0], 2 ** maximum_level[1])
     )
-    very_small_number = 1e-12
+    very_small_number = 1e-13
+    spacing = 1 / (2.0 ** np.array(maximum_level, dtype=np.float64))
     for x, y in product(
         range(0, 2 ** maximum_level[0]), range(0, 2 ** maximum_level[1])
     ):
-        x_coord = x / 2.0 ** maximum_level[0] + very_small_number
-        y_coord = y / 2.0 ** maximum_level[1] + very_small_number
+        x_coord = x * spacing[0] + very_small_number
+        y_coord = y * spacing[1] + very_small_number
         dyada_coordinate = dyada.coordinates.coordinate_from_sequence(
             [x_coord, y_coord]
         )
         box_index = discretization.get_containing_box(dyada_coordinate)
         resampled_array[x, y] = coefficients[box_index]
 
-    plt.imshow(
-        resampled_array,
-        cmap="Greys", vmin=0., vmax=1.0
-    )
+    plt.imshow(resampled_array, cmap="Greys", vmin=0.0, vmax=1.0)
     plt.show()
 
 
@@ -267,17 +265,22 @@ if __name__ == "__main__":
     num_dimensions = discretization.descriptor.get_num_dimensions()
 
     # coarsen all zero-coefficient values -> lossless
+    coarsened_index = 0
     while True:
         p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
         current_length = len(discretization.descriptor)
         ic(current_length, len(discretization))
-        for descriptor_index in range(len(discretization.descriptor)):
+        for descriptor_index in range(coarsened_index, len(discretization.descriptor)):
+            if len(p._planned_refinements) > 0:
+                break
             num_refinements = discretization.descriptor[descriptor_index].count()
             if num_refinements < 1:
                 continue
             # plan coarsening only if: all children are leaf nodes and all hierarchical coefficients are zeros
             num_children = num_refinements**2
-            children_indices = discretization.descriptor.get_children(descriptor_index)
+            children_indices = discretization.descriptor.get_children(
+                descriptor_index
+            )  # TODO speed up w/ branch to parent
             if any(len(coefficients[c]) > 1 for c in children_indices):
                 continue
             if coefficients[descriptor_index][-1] != 0:
@@ -303,7 +306,7 @@ if __name__ == "__main__":
                     if all(
                         coefficients[descriptor_index][hierarchical_index] == 0.0
                         for hierarchical_index in hierarchical_coefficent_indices
-                    ) and (len(p._planned_refinements) == 0):
+                    ):
                         one_d_refinement = get_one_d_refinement(d_i, num_dimensions)
                         p.plan_coarsening(
                             descriptor_index,
@@ -314,6 +317,7 @@ if __name__ == "__main__":
             # nothing more to compress
             break
         planned_refinements = p._planned_refinements
+        coarsened_index = planned_refinements[0][0]
         new_descriptor, mapping = p.apply_refinements(
             track_mapping="patches"
         )  # TODO allow combining independent refinements
