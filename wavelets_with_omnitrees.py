@@ -120,10 +120,10 @@ def read_img_file(filename: str) -> npt.NDArray[np.float16]:
     return img_array
 
 
-def plot_2d_image(
+def get_resampled_image(
     discretization: dyada.discretization.Discretization,
     coefficients: Sequence[np.float32],
-):
+) -> npt.NDArray[np.float32]:
     maximum_level = discretization.descriptor.get_maximum_level()
     maximum_level = maximum_level.astype(np.int64)
     resampled_array: npt.NDArray = np.ndarray(
@@ -142,7 +142,13 @@ def plot_2d_image(
         box_index = discretization.get_containing_box(dyada_coordinate)
         resampled_array[x, y] = coefficients[box_index]
 
-    plt.imshow(resampled_array, cmap="Greys", vmin=0.0, vmax=1.0)
+    return resampled_array
+
+
+def plot_2d_image(
+    resampled_array: npt.NDArray[np.float32],
+) -> None:
+    plt.imshow(resampled_array, cmap="Greys")  # , vmin=0.0, vmax=1.0)
     plt.show()
 
 
@@ -252,7 +258,8 @@ if __name__ == "__main__":
     initial_length = len(ordered_input_coefficients)
 
     # show the original image
-    plot_2d_image(discretization, ordered_input_coefficients)
+    raster_before = get_resampled_image(discretization, ordered_input_coefficients)
+    plot_2d_image(raster_before)
 
     # # transform to Haar wavelet data
     ic("start transforming")
@@ -378,7 +385,11 @@ if __name__ == "__main__":
         if discretization.descriptor.is_box(index)
     ]
     assert len(scaling_coefficients) == len(discretization)
-    plot_2d_image(discretization, scaling_coefficients)
+    raster_after = get_resampled_image(discretization, scaling_coefficients)
+    plot_2d_image(raster_after)
     ic(initial_length, len(scaling_coefficients))
 
+    assert raster_before.shape == raster_after.shape
+    difference = np.abs(raster_before - raster_after)
+    ic(np.max(difference), np.mean(difference))
     # coarsen leaves with low coefficients until compression ratio is reached #TODO
