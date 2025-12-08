@@ -31,7 +31,9 @@ def coefficient_matrix(
     dimensionality: int, one_d_transform: Callable[[], npt.NDArray[np.int8]]
 ) -> npt.NDArray:
     coefficients = one_d_transform()
-    if dimensionality == 1:
+    if dimensionality == 0:
+        return np.array([[1]], dtype=np.int8)
+    elif dimensionality == 1:
         return coefficients
     return np.kron(
         coefficients, coefficient_matrix(dimensionality - 1, one_d_transform)
@@ -53,11 +55,11 @@ def nodalization_matrix(num_refined_dimensions: int) -> npt.NDArray[np.int8]:
 
 def hierarchize(
     nodal_coefficients: Sequence, num_refined_dimensions: int
-) -> npt.NDArray[np.float128]:
+) -> npt.NDArray[np.float32]:
     result = np.matmul(
         hierarchization_matrix(num_refined_dimensions),
         nodal_coefficients,
-        dtype=np.float128,
+        dtype=np.float32,
     )
     # scope for asserting perfect reconstructability
     if True:
@@ -65,6 +67,17 @@ def hierarchize(
             nodal_coefficients
             == np.matmul(nodalization_matrix(num_refined_dimensions), result)
         )
+    return result
+
+
+def dehierarchize(
+    hierarchical_coefficients: Sequence, num_refined_dimensions: int
+) -> npt.NDArray[np.float32]:
+    result = np.matmul(
+        nodalization_matrix(num_refined_dimensions),
+        hierarchical_coefficients,
+        dtype=np.float32,
+    )
     return result
 
 
@@ -108,6 +121,28 @@ def transform_to_all_wavelet_coefficients(
             computed_scaling_coefficients.append(coefficients[descriptor_index][0])  # type: ignore
 
     return coefficients
+
+
+def fill_scaling_from_hierarchical_coefficients(
+    discretization: dyada.discretization.Discretization,
+    coefficients: Sequence[Optional[Sequence[np.float32]]],
+):
+    # fills in the scaling coefficients from the hierarchical coefficients
+    # iterate from the top down
+    for i_c, coeff_array in enumerate(coefficients):
+        assert coeff_array is not None
+        assert coeff_array[0] is not None
+        refinement = discretization.descriptor[i_c]
+        num_refined_dimensions = refinement.count()
+        scaling_coefficients = dehierarchize(coeff_array, num_refined_dimensions)
+        # assign the scaling coefficients to the children
+        children_indices = discretization.descriptor.get_children(i_c)
+        for i_child, child_index in enumerate(children_indices):
+            assert coefficients[child_index] is not None
+            assert coefficients[child_index][0] is None or np.isnan(
+                coefficients[child_index][0]
+            )
+            coefficients[child_index][0] = scaling_coefficients[i_child]
 
 
 def read_img_file(filename: str) -> npt.NDArray[np.float16]:
@@ -267,6 +302,12 @@ if __name__ == "__main__":
         discretization,
         ordered_input_coefficients,  # type: ignore
     )
+
+    # drop the scaling coefficients
+    base_scaling_coefficient = coefficients[0][0]
+    for c in coefficients:
+        c[0] = None
+    coefficients[0][0] = base_scaling_coefficient
     ic(len(coefficients))
     assert all(len(c) > 0 for c in coefficients)
     num_dimensions = discretization.descriptor.get_num_dimensions()
@@ -304,7 +345,7 @@ if __name__ == "__main__":
         new_discretization, mapping = p.apply_refinements(
             track_mapping="patches"
         )  # TODO allow combining independent refinements
-        new_coefficients = {}
+        new_coefficients = [np.nan for _ in range(len(new_discretization.descriptor))]
         planned_refinements_as_dict = {
             planned_refinement[0]: planned_refinement[1]
             for planned_refinement in planned_refinements
@@ -339,6 +380,7 @@ if __name__ == "__main__":
         coefficients = new_coefficients
 
     # validate by showing the image again
+    fill_scaling_from_hierarchical_coefficients(discretization, coefficients)
     scaling_coefficients = [
         coefficients[index][0]
         for index in range(len(coefficients))
