@@ -157,9 +157,9 @@ def get_numbers_with_ith_bit_set(i_set_bit_index: int, bit_length: int) -> set[i
     numbers = set()
     for j in range(2 ** (bit_length)):
         j_as_bitarray = bitarray.util.int2ba(j, length=bit_length)
-        if (
-            get_one_d_refinement(i_set_bit_index, bit_length) & j_as_bitarray
-        ).count() > 0:
+        one_d_refinement = get_one_d_refinement(i_set_bit_index, bit_length)
+
+        if (one_d_refinement & j_as_bitarray).count() > 0:
             numbers.add(j)
     return numbers
 
@@ -171,7 +171,7 @@ def get_set_bitarray_indices(bits: ba.bitarray) -> set[int]:
 @lru_cache(maxsize=None)
 def get_one_d_refinement(i_set_bit_index: int, bit_length: int) -> ba.bitarray:
     one_d_refinement = ba.bitarray("0" * bit_length)
-    one_d_refinement[bit_length - 1 - i_set_bit_index] = 1
+    one_d_refinement[i_set_bit_index] = 1
     return one_d_refinement
 
 
@@ -278,9 +278,8 @@ if __name__ == "__main__":
         current_length = len(discretization.descriptor)
         ic(current_length, len(discretization))
         for descriptor_index in range(coarsened_index, len(discretization.descriptor)):
-            if len(p._planned_refinements) > 0:
-                break
-            num_refinements = discretization.descriptor[descriptor_index].count()
+            current_refinement = discretization.descriptor[descriptor_index]
+            num_refinements = current_refinement.count()
             if num_refinements < 1:
                 continue
             # plan coarsening only if: all children are leaf nodes and all hierarchical coefficients are zeros
@@ -298,84 +297,45 @@ if __name__ == "__main__":
                     descriptor_index,
                     discretization.descriptor[descriptor_index],
                 )
-                break
-            else:
-                # TODO needs dyada.linearization if not Z order
-                refined_dimensions = get_set_bitarray_indices(
-                    discretization.descriptor[descriptor_index]
-                )
-                for d_i in refined_dimensions:
-                    # translate the hierarchical function index
-                    # into which refinements are involved in the hierarchical coefficient
-                    hierarchical_coefficent_indices = get_numbers_with_ith_bit_set(
-                        d_i, num_dimensions
-                    )
-                    if all(
-                        coefficients[descriptor_index][hierarchical_index] == 0.0
-                        for hierarchical_index in hierarchical_coefficent_indices
-                    ):
-                        one_d_refinement = get_one_d_refinement(d_i, num_dimensions)
-                        p.plan_coarsening(
-                            descriptor_index,
-                            one_d_refinement,
-                        )
-                        break
         if len(p._planned_refinements) == 0:
             # nothing more to compress
             break
         planned_refinements = p._planned_refinements
-        coarsened_index = planned_refinements[0][0]
-        new_descriptor, mapping = p.apply_refinements(
+        new_discretization, mapping = p.apply_refinements(
             track_mapping="patches"
         )  # TODO allow combining independent refinements
-
-        dyada.descriptor.validate_descriptor(new_descriptor)
-        new_descriptor, normalization_mapping, num_rounds = (
-            dyada.refinement.normalize_discretization(
-                dyada.discretization.Discretization(
-                    discretization._linearization, new_descriptor
-                ),
-                track_mapping="patches",
-            )
-        )
-        dyada.descriptor.validate_descriptor(new_descriptor)
-        new_discretization = dyada.discretization.Discretization(
-            discretization._linearization, new_descriptor
-        )
-        assert num_rounds < 2
-        try:
-            mapping = dyada.refinement.merge_mappings(mapping, normalization_mapping)
-        except Exception as e:
-            ic(mapping, normalization_mapping)
-            raise e
         new_coefficients = {}
-        for key, value in sorted(mapping.items(), reverse=True):
-            assert len(value) == 1
-            new_coefficients[value[0]] = coefficients[key]
-            # shorten the arrays if necessary
-            if key in planned_refinements and min(planned_refinements[key]) < 0:
+        planned_refinements_as_dict = {
+            planned_refinement[0]: planned_refinement[1]
+            for planned_refinement in planned_refinements
+        }
+        new_index_counter = Counter(m for s in mapping for m in s)
+        for new_index, count in new_index_counter.items():
+            first_found_old_index = next(
+                old_index
+                for old_index, mapped_to in enumerate(mapping)
+                if new_index in mapped_to
+            )
+            new_coefficients[new_index] = coefficients[first_found_old_index]
+            if count > 1:
+                assert first_found_old_index in planned_refinements_as_dict
                 # accumulate negative entries
                 negative_refined_at = (
                     d_i
                     for d_i in range(num_dimensions)
-                    if planned_refinements[key][d_i] < 0
+                    if planned_refinements_as_dict[first_found_old_index][d_i] < 0
                 )
                 hierarchical_coefficent_indices_to_delete: set[int] = set()
                 for refined_dimension in negative_refined_at:
                     hierarchical_coefficent_indices_to_delete.update(
-                        get_numbers_with_ith_bit_set(
-                            num_dimensions - 1 - refined_dimension, num_dimensions
-                        )
+                        get_numbers_with_ith_bit_set(refined_dimension, num_dimensions)
                     )
-                new_coefficients[value[0]] = np.delete(
-                    arr=new_coefficients[value[0]],
+                new_coefficients[new_index] = np.delete(
+                    arr=new_coefficients[new_index],
                     obj=list(hierarchical_coefficent_indices_to_delete),
                 )
-        dyada.descriptor.validate_descriptor(new_descriptor)  # TODO remove
-        discretization = dyada.discretization.Discretization(
-            discretization._linearization, new_descriptor
-        )
-        assert len(discretization.descriptor) == len(new_coefficients)
+        assert len(new_discretization.descriptor) == len(new_coefficients)
+        discretization = new_discretization
         coefficients = new_coefficients
 
     # validate by showing the image again
