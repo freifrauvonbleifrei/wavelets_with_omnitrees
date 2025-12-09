@@ -131,14 +131,18 @@ def fill_scaling_from_hierarchical_coefficients(
 ):
     # fills in the scaling coefficients from the hierarchical coefficients
     # iterate from the top down
-    for i_c, coeff_array in enumerate(coefficients):
+    for i_c, (branch, refinement) in enumerate(
+        dyada.descriptor.branch_generator(discretization.descriptor)
+    ):
+        coeff_array = coefficients[i_c]
         assert coeff_array is not None
         assert coeff_array[0] is not None
-        refinement = discretization.descriptor[i_c]
         num_refined_dimensions = refinement.count()
         scaling_coefficients = dehierarchize(coeff_array, num_refined_dimensions)
         # assign the scaling coefficients to the children
-        children_indices = discretization.descriptor.get_children(i_c)
+        children_indices = discretization.descriptor.get_children(
+            i_c, branch_to_parent=branch
+        )
         for i_child, child_index in enumerate(children_indices):
             assert coefficients[child_index] is not None
             assert coefficients[child_index][0] is None or np.isnan(
@@ -334,21 +338,21 @@ if __name__ == "__main__":
     num_dimensions = discretization.descriptor.get_num_dimensions()
 
     # coarsen all zero-coefficient values -> lossless
-    coarsened_index = 0
     while True:
         p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
         current_length = len(discretization.descriptor)
         ic(current_length, len(discretization))
-        for descriptor_index in range(coarsened_index, len(discretization.descriptor)):
-            current_refinement = discretization.descriptor[descriptor_index]
+        for descriptor_index, (branch, current_refinement) in enumerate(
+            dyada.descriptor.branch_generator(discretization.descriptor)
+        ):
             num_refinements = current_refinement.count()
             if num_refinements < 1:
                 continue
             # plan coarsening only if: all children are leaf nodes and all hierarchical coefficients are zeros
             num_children = num_refinements**2
             children_indices = discretization.descriptor.get_children(
-                descriptor_index
-            )  # TODO speed up w/ branch to parent
+                descriptor_index, branch_to_parent=branch
+            )
             if any(len(coefficients[c]) > 1 for c in children_indices):
                 continue
             if coefficients[descriptor_index][-1] != 0:
