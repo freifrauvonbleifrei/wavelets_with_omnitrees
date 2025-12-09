@@ -394,15 +394,14 @@ if __name__ == "__main__":
             planned_refinement[0]: planned_refinement[1]
             for planned_refinement in planned_refinements
         }
-        new_index_counter = Counter(m for s in mapping for m in s)
-        for new_index, count in new_index_counter.items():
-            first_found_old_index = next(
-                old_index
-                for old_index, mapped_to in enumerate(mapping)
-                if new_index in mapped_to
-            )
+        inverted_mapping: dict[int, set[int]] = {}
+        for old_index, mapped_to in enumerate(mapping):
+            for new_index in mapped_to:
+                inverted_mapping.setdefault(new_index, set()).add(old_index)
+        for new_index, mapped_from in inverted_mapping.items():
+            first_found_old_index = min(mapped_from)
             new_coefficients[new_index] = coefficients[first_found_old_index]
-            if count > 1:
+            if len(mapped_from) > 1:
                 if first_found_old_index not in planned_refinements_as_dict:
                     continue
                 # accumulate negative entries
