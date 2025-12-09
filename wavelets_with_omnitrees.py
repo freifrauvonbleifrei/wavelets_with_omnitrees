@@ -178,19 +178,24 @@ def get_resampled_image(
     resampled_array: npt.NDArray = np.ndarray(
         shape=(2 ** maximum_level[0], 2 ** maximum_level[1])
     )
-    very_small_number = 1e-13  # to break ambiguity at cell boundaries
-    spacing = 1 / (2.0 ** np.array(maximum_level, dtype=np.float64))
-    for x, y in product(
-        range(0, 2 ** maximum_level[0]), range(0, 2 ** maximum_level[1])
+    # fast(er) iteration over all boxes
+    box_index = -1
+    for branch, refinement in dyada.descriptor.branch_generator(
+        discretization.descriptor
     ):
-        x_coord = x * spacing[0] + very_small_number
-        y_coord = y * spacing[1] + very_small_number
-        dyada_coordinate = dyada.coordinates.coordinate_from_sequence(
-            [x_coord, y_coord]
-        )
-        box_index = discretization.get_containing_box(dyada_coordinate)
-        resampled_array[x, y] = coefficients[box_index]
-
+        if refinement.count() == 0:  # leaf node
+            box_index += 1
+            location_level, location_index = (
+                dyada.discretization.get_level_index_from_branch(
+                    linearization=discretization._linearization, branch=branch
+                )
+            )
+            box_size = 2 ** (maximum_level - location_level)
+            min_corner = location_index * box_size
+            max_corner = min_corner + box_size
+            resampled_array[
+                min_corner[0] : max_corner[0], min_corner[1] : max_corner[1]
+            ] = coefficients[box_index]
     return resampled_array
 
 
