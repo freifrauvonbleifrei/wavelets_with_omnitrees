@@ -11,6 +11,7 @@ import numpy.typing as npt
 from icecream import ic
 from itertools import product
 from PIL import Image
+from libtiff import TIFF
 from typing import Callable, Optional, Sequence
 
 import dyada
@@ -151,8 +152,20 @@ def read_img_file(filename: str) -> npt.NDArray[np.float16]:
     Reads an image file and returns the pixel values as a numpy array.
     The image is converted to grayscale and normalized to [0, 1].
     """
-    img = Image.open(filename).convert("L")  # Convert to grayscale
-    img_array = np.array(img, dtype=np.float16) / 255.0  # Normalize to [0, 1]
+    if filename.lower().endswith(".tiff") or filename.lower().endswith(".tif"):
+        tiff = TIFF.open(filename, mode="r")
+        img_array = tiff.read_image()
+        if len(img_array.shape) == 3:
+            # Convert to grayscale using luminosity method
+            img_array = (
+                0.2989 * img_array[:, :, 0]
+                + 0.5870 * img_array[:, :, 1]
+                + 0.1140 * img_array[:, :, 2]
+            )
+        img_array = img_array.astype(np.float16) / 255.0  # Normalize to [0, 1]
+    else:
+        img = Image.open(filename, mode="r").convert("L")  # Convert to grayscale
+        img_array = np.array(img, dtype=np.float16) / 255.0  # Normalize to [0, 1]
     return img_array
 
 
@@ -165,7 +178,7 @@ def get_resampled_image(
     resampled_array: npt.NDArray = np.ndarray(
         shape=(2 ** maximum_level[0], 2 ** maximum_level[1])
     )
-    very_small_number = 1e-13
+    very_small_number = 1e-13  # to break ambiguity at cell boundaries
     spacing = 1 / (2.0 ** np.array(maximum_level, dtype=np.float64))
     for x, y in product(
         range(0, 2 ** maximum_level[0]), range(0, 2 ** maximum_level[1])
@@ -247,12 +260,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # read the data tensor
-    if args.file_to_compress.endswith(".png") or args.file_to_compress.endswith(".jpg"):
-        data = read_img_file(args.file_to_compress)
-    else:
-        raise NotImplementedError(
-            "File extension of " + args.file_to_compress + " not supported"
-        )
+    data = read_img_file(args.file_to_compress)
 
     # construct matching discretization
     input_shape = data.shape
