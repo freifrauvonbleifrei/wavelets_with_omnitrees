@@ -2,6 +2,7 @@
 import argparse as arg
 import bitarray as ba
 import bitarray.util
+from collections import Counter
 from functools import lru_cache
 import matplotlib.pyplot as plt
 import math
@@ -188,12 +189,15 @@ def plot_2d_image(
 
 
 @lru_cache(maxsize=None)
-def get_numbers_with_ith_bit_set(i_set_bit_index: int, bit_length: int) -> set[int]:
+def get_numbers_with_ith_bit_set(
+    i_set_bit_index: int, bit_length: int, reverse: bool = False
+) -> set[int]:
     numbers = set()
     for j in range(2 ** (bit_length)):
         j_as_bitarray = bitarray.util.int2ba(j, length=bit_length)
-        one_d_refinement = get_one_d_refinement(i_set_bit_index, bit_length)
-
+        one_d_refinement = get_one_d_refinement(
+            i_set_bit_index, bit_length, reverse=reverse
+        )
         if (one_d_refinement & j_as_bitarray).count() > 0:
             numbers.add(j)
     return numbers
@@ -204,9 +208,13 @@ def get_set_bitarray_indices(bits: ba.bitarray) -> set[int]:
 
 
 @lru_cache(maxsize=None)
-def get_one_d_refinement(i_set_bit_index: int, bit_length: int) -> ba.bitarray:
+def get_one_d_refinement(
+    i_set_bit_index: int, bit_length: int, reverse=False
+) -> ba.bitarray:
     one_d_refinement = ba.bitarray("0" * bit_length)
     one_d_refinement[i_set_bit_index] = 1
+    if reverse:
+        one_d_refinement.reverse()
     return one_d_refinement
 
 
@@ -338,6 +346,25 @@ if __name__ == "__main__":
                     descriptor_index,
                     discretization.descriptor[descriptor_index],
                 )
+            else:
+                refined_dimensions = get_set_bitarray_indices(current_refinement)
+                for d_i in refined_dimensions:
+                    # translate the hierarchical function index
+                    # into which refinements are involved in the hierarchical coefficient
+                    hierarchical_coefficent_indices = get_numbers_with_ith_bit_set(
+                        d_i, num_dimensions
+                    )
+                    if all(
+                        coefficients[descriptor_index][hierarchical_index] == 0.0
+                        for hierarchical_index in hierarchical_coefficent_indices
+                    ):
+                        one_d_refinement = get_one_d_refinement(
+                            d_i, num_dimensions, reverse=True
+                        )
+                        p.plan_coarsening(
+                            descriptor_index,
+                            one_d_refinement,
+                        )
         if len(p._planned_refinements) == 0:
             # nothing more to compress
             break
@@ -359,7 +386,8 @@ if __name__ == "__main__":
             )
             new_coefficients[new_index] = coefficients[first_found_old_index]
             if count > 1:
-                assert first_found_old_index in planned_refinements_as_dict
+                if first_found_old_index not in planned_refinements_as_dict:
+                    continue
                 # accumulate negative entries
                 negative_refined_at = (
                     d_i
@@ -369,7 +397,9 @@ if __name__ == "__main__":
                 hierarchical_coefficent_indices_to_delete: set[int] = set()
                 for refined_dimension in negative_refined_at:
                     hierarchical_coefficent_indices_to_delete.update(
-                        get_numbers_with_ith_bit_set(refined_dimension, num_dimensions)
+                        get_numbers_with_ith_bit_set(
+                            refined_dimension, num_dimensions, reverse=True
+                        )
                     )
                 new_coefficients[new_index] = np.delete(
                     arr=new_coefficients[new_index],
@@ -394,4 +424,5 @@ if __name__ == "__main__":
     assert raster_before.shape == raster_after.shape
     difference = np.abs(raster_before - raster_after)
     ic(np.max(difference), np.mean(difference))
+    assert np.max(difference) < 0.00000001
     # coarsen leaves with low coefficients until compression ratio is reached #TODO
