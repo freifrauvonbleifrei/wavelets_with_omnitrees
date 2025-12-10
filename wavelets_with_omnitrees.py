@@ -385,15 +385,11 @@ if __name__ == "__main__":
         if len(p._planned_refinements) == 0:
             # nothing more to compress
             break
-        planned_refinements = p._planned_refinements
-        new_discretization, mapping = p.apply_refinements(
-            track_mapping="patches"
-        )  # TODO allow combining independent refinements
-        new_coefficients = [np.nan for _ in range(len(new_discretization.descriptor))]
-        planned_refinements_as_dict = {
-            planned_refinement[0]: planned_refinement[1]
-            for planned_refinement in planned_refinements
-        }
+        new_discretization, mapping = p.apply_refinements(track_mapping="patches")
+        planned_refinements_as_dict = p._markers
+        if __debug__:
+            dyada.descriptor.validate_descriptor(new_discretization.descriptor)
+        new_coefficients = [[np.nan] for _ in range(len(new_discretization.descriptor))]
         inverted_mapping: dict[int, set[int]] = {}
         for old_index, mapped_to in enumerate(mapping):
             for new_index in mapped_to:
@@ -438,7 +434,9 @@ if __name__ == "__main__":
     ic(initial_length, len(scaling_coefficients))
 
     assert raster_before.shape == raster_after.shape
-    difference = np.abs(raster_before - raster_after)
-    ic(np.max(difference), np.mean(difference))
-    assert np.max(difference) < 0.00000001
+    difference = raster_before - raster_after
+    abs_difference = np.abs(difference)
+    ic(np.max(abs_difference), np.mean(difference))
+    assert np.max(abs_difference) < 0.00000001
+    assert np.mean(difference) == 0.0
     # coarsen leaves with low coefficients until compression ratio is reached #TODO
