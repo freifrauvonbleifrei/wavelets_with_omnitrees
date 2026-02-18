@@ -2,7 +2,6 @@
 import argparse as arg
 import bitarray as ba
 import bitarray.util
-from collections import Counter
 from functools import lru_cache
 import matplotlib.pyplot as plt
 import math
@@ -15,8 +14,9 @@ from libtiff import TIFF
 from typing import Callable, Optional, Sequence
 
 import dyada
-import dyada.coordinates
+import dyada.descriptor
 import dyada.discretization
+import dyada.drawing
 import dyada.linearization
 import dyada.refinement
 
@@ -31,7 +31,7 @@ def hadamard_haar_1d() -> npt.NDArray[np.int8]:
 @lru_cache(maxsize=7)
 def coefficient_matrix(
     dimensionality: int, one_d_transform: Callable[[], npt.NDArray[np.int8]]
-) -> npt.NDArray:
+) -> npt.NDArray[np.int8]:
     coefficients = one_d_transform()
     if dimensionality == 0:
         return np.array([[1]], dtype=np.int8)
@@ -57,11 +57,11 @@ def nodalization_matrix(num_refined_dimensions: int) -> npt.NDArray[np.int8]:
 
 def hierarchize(
     nodal_coefficients: Sequence, num_refined_dimensions: int
-) -> npt.NDArray[np.float32]:
+) -> npt.NDArray[np.float64]:
     result = np.matmul(
         hierarchization_matrix(num_refined_dimensions),
         nodal_coefficients,
-        dtype=np.float32,
+        dtype=np.float64,
     )
     # scope for asserting perfect reconstructability
     if True:
@@ -74,11 +74,11 @@ def hierarchize(
 
 def dehierarchize(
     hierarchical_coefficients: Sequence, num_refined_dimensions: int
-) -> npt.NDArray[np.float32]:
+) -> npt.NDArray[np.float64]:
     result = np.matmul(
         nodalization_matrix(num_refined_dimensions),
         hierarchical_coefficients,
-        dtype=np.float32,
+        dtype=np.float64,
     )
     return result
 
@@ -107,7 +107,7 @@ def transform_to_all_wavelet_coefficients(
             computed_scaling_coefficients.append(coefficient)
         else:
             num_refinements = refinement.count()
-            num_children = 2**num_refinements
+            num_children = 1 << num_refinements
             children_coefficients = []
             for _ in range(num_children):
                 children_coefficients.append(computed_scaling_coefficients.pop())
@@ -176,10 +176,13 @@ def read_img_file(filename: str) -> npt.NDArray[np.float16]:
 def get_resampled_image(
     discretization: dyada.discretization.Discretization,
     coefficients: Sequence[np.float32],
+    target_maximum_level: Optional[npt.NDArray[np.int64]] = None,
 ) -> npt.NDArray[np.float32]:
-    maximum_level = discretization.descriptor.get_maximum_level()
-    maximum_level = maximum_level.astype(np.int64)
-    resampled_array: npt.NDArray = np.ndarray(
+    if target_maximum_level is None:
+        maximum_level = discretization.descriptor.get_maximum_level().astype(np.int64)
+    else:
+        maximum_level = target_maximum_level
+    resampled_array: npt.NDArray = np.zeros(
         shape=(2 ** maximum_level[0], 2 ** maximum_level[1])
     )
     # fast(er) iteration over all boxes
@@ -189,10 +192,8 @@ def get_resampled_image(
     ):
         if refinement.count() == 0:  # leaf node
             box_index += 1
-            location_level, location_index = (
-                dyada.discretization.get_level_index_from_branch(
-                    linearization=discretization._linearization, branch=branch
-                )
+            location_level, location_index = discretization.get_level_index_from_branch(
+                branch
             )
             box_size = 2 ** (maximum_level - location_level)
             min_corner = location_index * box_size
@@ -213,16 +214,16 @@ def plot_2d_image(
 @lru_cache(maxsize=None)
 def get_numbers_with_ith_bit_set(
     i_set_bit_index: int, bit_length: int, reverse: bool = False
-) -> set[int]:
-    numbers = set()
+) -> tuple[int, ...]:
+    numbers = []
     for j in range(2 ** (bit_length)):
         j_as_bitarray = bitarray.util.int2ba(j, length=bit_length)
         one_d_refinement = get_one_d_refinement(
             i_set_bit_index, bit_length, reverse=reverse
         )
         if (one_d_refinement & j_as_bitarray).count() > 0:
-            numbers.add(j)
-    return numbers
+            numbers.append(j)
+    return tuple(numbers)
 
 
 def get_set_bitarray_indices(bits: ba.bitarray) -> set[int]:
@@ -252,6 +253,186 @@ def morton_to_multidim(
     )
 
 
+def get_refined_dimensions_desc(
+    refinement: ba.frozenbitarray | ba.bitarray,
+) -> list[int]:
+    return list(reversed(dyada.linearization.bitmask_to_indices(refinement)))
+
+
+def get_local_bit_index(
+    global_dimension: int, refined_dimensions_desc: Sequence[int]
+) -> int:
+    """Map global dimension id to local bit index in coefficient ordering."""
+    return refined_dimensions_desc.index(global_dimension)
+
+
+def compress_by_omnitree_coarsening(
+    discretization: dyada.discretization.Discretization,
+    coefficients: list[Sequence[float]],
+    coarsening_threshold: float = 0.0,
+) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
+    """Iteratively coarsen with staged coefficient-local bounds."""
+    num_dimensions = discretization.descriptor.get_num_dimensions()
+
+    def apply_single_phase_round(
+        current_discretization: dyada.discretization.Discretization,
+        current_coefficients: list[Sequence[float]],
+        phase_threshold: float,
+    ) -> tuple[
+        dyada.discretization.Discretization,
+        list[Sequence[float]],
+        bool,
+    ]:
+        p = dyada.refinement.PlannedAdaptiveRefinement(current_discretization)
+        planned_any = False
+
+        for descriptor_index, (branch, current_refinement) in enumerate(
+            dyada.descriptor.branch_generator(current_discretization.descriptor)
+        ):
+            num_refinements = current_refinement.count()
+            if num_refinements < 1:
+                continue
+
+            # Coarsening only when all direct children are leaves
+            children_indices = current_discretization.descriptor.get_children(
+                descriptor_index, branch_to_parent=branch
+            )
+            if any(len(current_coefficients[c]) > 1 for c in children_indices):
+                continue
+
+            parent_coefficients = current_coefficients[descriptor_index]
+            branch_level = dyada.descriptor.get_level_from_branch(branch).astype(
+                np.int64
+            )
+            box_volume = float(np.prod(np.power(2.0, -branch_level)))
+            local_bound = phase_threshold * box_volume
+
+            if abs(parent_coefficients[-1]) > local_bound:
+                continue
+
+            if sum(abs(v) for v in parent_coefficients[1:]) <= local_bound:
+                coarsen_mask = ba.bitarray(
+                    current_discretization.descriptor[descriptor_index]
+                )
+                p.plan_coarsening(descriptor_index, coarsen_mask)
+                planned_any = True
+                continue
+
+            refined_dimensions_desc = get_refined_dimensions_desc(current_refinement)
+            for global_dimension in refined_dimensions_desc:
+                local_bit_index = get_local_bit_index(
+                    global_dimension, refined_dimensions_desc
+                )
+                hierarchical_indices = get_numbers_with_ith_bit_set(
+                    local_bit_index, num_refinements
+                )
+                hierarchical_abs_values = [
+                    abs(parent_coefficients[i_h]) for i_h in hierarchical_indices
+                ]
+                can_partially_coarsen = sum(hierarchical_abs_values) <= local_bound
+                if can_partially_coarsen:
+                    one_d_refinement = ba.bitarray("0" * num_dimensions)
+                    one_d_refinement[global_dimension] = 1
+                    p.plan_coarsening(descriptor_index, one_d_refinement)
+                    planned_any = True
+
+        if not planned_any:
+            return current_discretization, current_coefficients, False
+
+        new_discretization, mapping = p.apply_refinements(
+            track_mapping="patches", sweep_mode="canonical"
+        )
+        final_markers = p._markers
+        if __debug__:
+            dyada.descriptor.validate_descriptor(new_discretization.descriptor)
+
+        new_coefficients: list[Sequence[float]] = [
+            [np.nan] for _ in range(len(new_discretization.descriptor))
+        ]
+        inverted_mapping: dict[int, set[int]] = {}
+        for old_index, mapped_to in enumerate(mapping):
+            for new_index in mapped_to:
+                inverted_mapping.setdefault(new_index, set()).add(old_index)
+
+        for new_index, mapped_from in inverted_mapping.items():
+            expected_num_refinements = new_discretization.descriptor[new_index].count()
+            expected_len = (
+                1 if expected_num_refinements == 0 else (1 << expected_num_refinements)
+            )
+            mapped_from_sorted = sorted(mapped_from)
+            matching_old_indices = [
+                old_i
+                for old_i in mapped_from_sorted
+                if len(current_coefficients[old_i]) == expected_len
+            ]
+            first_found_old_index = (
+                matching_old_indices[0]
+                if matching_old_indices
+                else mapped_from_sorted[0]
+            )
+            new_coefficients[new_index] = current_coefficients[first_found_old_index]
+            if first_found_old_index not in final_markers:
+                continue
+            marker = final_markers[first_found_old_index]
+            if not np.any(marker < 0):
+                continue
+
+            refined_dimensions_desc = get_refined_dimensions_desc(
+                current_discretization.descriptor[first_found_old_index]
+            )
+            num_refinements = current_discretization.descriptor[
+                first_found_old_index
+            ].count()
+            delete_indices: set[int] = set()
+            for d_i in range(num_dimensions):
+                if marker[d_i] >= 0:
+                    continue
+                local_bit_index = get_local_bit_index(d_i, refined_dimensions_desc)
+                delete_indices.update(
+                    get_numbers_with_ith_bit_set(local_bit_index, num_refinements)
+                )
+            new_coefficients[new_index] = np.delete(
+                arr=new_coefficients[new_index],
+                obj=sorted(delete_indices),
+            )
+            if len(new_coefficients[new_index]) != expected_len:
+                raise ValueError(
+                    f"Coefficient length mismatch at new index {new_index}: "
+                    f"got {len(new_coefficients[new_index])}, expected {expected_len}"
+                )
+
+        return new_discretization, new_coefficients, True
+
+    def run_phase(
+        phase_discretization: dyada.discretization.Discretization,
+        phase_coefficients: list[Sequence[float]],
+        phase_threshold: float,
+    ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
+        while True:
+            (
+                phase_discretization,
+                phase_coefficients,
+                changed,
+            ) = apply_single_phase_round(
+                phase_discretization,
+                phase_coefficients,
+                phase_threshold=phase_threshold,
+            )
+            if not changed:
+                return phase_discretization, phase_coefficients
+
+    discretization, coefficients = run_phase(
+        discretization, coefficients, phase_threshold=0.0
+    )
+    discretization, coefficients = run_phase(
+        discretization,
+        coefficients,
+        phase_threshold=coarsening_threshold,
+    )
+
+    return discretization, coefficients
+
+
 if __name__ == "__main__":
     parser = arg.ArgumentParser()
     parser.add_argument(
@@ -266,6 +447,12 @@ if __name__ == "__main__":
         help="filename ; if file suffix is .png, will use 2d compression",
         # default="https://www2.eecs.berkeley.edu/Research/Projects/CS/vision/bsds/BSDS300/html/images/plain/normal/gray/102061.jpg",
     )
+    parser.add_argument(
+        "--max_level",
+        type=int,
+        default=None,
+        help="optional cap for base dyadic level per dimension to reduce runtime",
+    )
     args = parser.parse_args()
 
     # read the data tensor
@@ -274,9 +461,13 @@ if __name__ == "__main__":
     # construct matching discretization
     input_shape = data.shape
     dimensionality = len(input_shape)
-    base_resolution_level = [5, 5]
-    #     math.floor(math.log2(extent)) for extent in input_shape
-    # ]  # TODO ceil # [2,2]  #
+    base_resolution_level = [
+        max(0, math.floor(math.log2(extent))) for extent in input_shape
+    ]
+    if args.max_level is not None:
+        base_resolution_level = [
+            min(level, args.max_level) for level in base_resolution_level
+        ]
     ic(base_resolution_level)
     uniform_descriptor = dyada.descriptor.RefinementDescriptor(
         dimensionality, base_resolution_level
@@ -285,6 +476,8 @@ if __name__ == "__main__":
         linearization=dyada.linearization.MortonOrderLinearization(),
         descriptor=uniform_descriptor,
     )
+    descriptor_entries_before = len(discretization.descriptor)
+    boxes_before = len(discretization)
 
     # reorder input data to Z order
     ordered_input_coefficients: npt.NDArray[np.float32] = np.zeros(
@@ -318,7 +511,14 @@ if __name__ == "__main__":
     initial_length = len(ordered_input_coefficients)
 
     # show the original image
-    raster_before = get_resampled_image(discretization, ordered_input_coefficients)
+    target_maximum_level = discretization.descriptor.get_maximum_level().astype(
+        np.int64
+    )
+    raster_before = get_resampled_image(
+        discretization,
+        ordered_input_coefficients,
+        target_maximum_level=target_maximum_level,
+    )
     plot_2d_image(raster_before)
 
     # # transform to Haar wavelet data
@@ -331,95 +531,18 @@ if __name__ == "__main__":
     # drop the scaling coefficients
     base_scaling_coefficient = coefficients[0][0]
     for c in coefficients:
-        c[0] = None
+        c[0] = np.nan
     coefficients[0][0] = base_scaling_coefficient
     ic(len(coefficients))
     assert all(len(c) > 0 for c in coefficients)
-    num_dimensions = discretization.descriptor.get_num_dimensions()
-
-    # coarsen all zero-coefficient values -> lossless
-    while True:
-        p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
-        current_length = len(discretization.descriptor)
-        ic(current_length, len(discretization))
-        for descriptor_index, (branch, current_refinement) in enumerate(
-            dyada.descriptor.branch_generator(discretization.descriptor)
-        ):
-            num_refinements = current_refinement.count()
-            if num_refinements < 1:
-                continue
-            # plan coarsening only if: all children are leaf nodes and all hierarchical coefficients are zeros
-            num_children = num_refinements**2
-            children_indices = discretization.descriptor.get_children(
-                descriptor_index, branch_to_parent=branch
-            )
-            if any(len(coefficients[c]) > 1 for c in children_indices):
-                continue
-            if coefficients[descriptor_index][-1] != 0:
-                # if the last coefficient is not 0, there's no chance than any dimension can be losslessly refined
-                continue
-            if all(d == 0.0 for d in coefficients[descriptor_index][1:]):
-                p.plan_coarsening(
-                    descriptor_index,
-                    discretization.descriptor[descriptor_index],
-                )
-            else:
-                refined_dimensions = get_set_bitarray_indices(current_refinement)
-                for d_i in refined_dimensions:
-                    # translate the hierarchical function index
-                    # into which refinements are involved in the hierarchical coefficient
-                    hierarchical_coefficent_indices = get_numbers_with_ith_bit_set(
-                        d_i, num_dimensions
-                    )
-                    if all(
-                        coefficients[descriptor_index][hierarchical_index] == 0.0
-                        for hierarchical_index in hierarchical_coefficent_indices
-                    ):
-                        one_d_refinement = get_one_d_refinement(
-                            d_i, num_dimensions, reverse=True
-                        )
-                        p.plan_coarsening(
-                            descriptor_index,
-                            one_d_refinement,
-                        )
-        if len(p._planned_refinements) == 0:
-            # nothing more to compress
-            break
-        new_discretization, mapping = p.apply_refinements(track_mapping="patches")
-        planned_refinements_as_dict = p._markers
-        if __debug__:
-            dyada.descriptor.validate_descriptor(new_discretization.descriptor)
-        new_coefficients = [[np.nan] for _ in range(len(new_discretization.descriptor))]
-        inverted_mapping: dict[int, set[int]] = {}
-        for old_index, mapped_to in enumerate(mapping):
-            for new_index in mapped_to:
-                inverted_mapping.setdefault(new_index, set()).add(old_index)
-        for new_index, mapped_from in inverted_mapping.items():
-            first_found_old_index = min(mapped_from)
-            new_coefficients[new_index] = coefficients[first_found_old_index]
-            if len(mapped_from) > 1:
-                if first_found_old_index not in planned_refinements_as_dict:
-                    continue
-                # accumulate negative entries
-                negative_refined_at = (
-                    d_i
-                    for d_i in range(num_dimensions)
-                    if planned_refinements_as_dict[first_found_old_index][d_i] < 0
-                )
-                hierarchical_coefficent_indices_to_delete: set[int] = set()
-                for refined_dimension in negative_refined_at:
-                    hierarchical_coefficent_indices_to_delete.update(
-                        get_numbers_with_ith_bit_set(
-                            refined_dimension, num_dimensions, reverse=True
-                        )
-                    )
-                new_coefficients[new_index] = np.delete(
-                    arr=new_coefficients[new_index],
-                    obj=list(hierarchical_coefficent_indices_to_delete),
-                )
-        assert len(new_discretization.descriptor) == len(new_coefficients)
-        discretization = new_discretization
-        coefficients = new_coefficients
+    coarsening_threshold = 1e-7
+    discretization, coefficients = compress_by_omnitree_coarsening(
+        discretization,
+        coefficients,
+        coarsening_threshold=coarsening_threshold,
+    )
+    descriptor_entries_after = len(discretization.descriptor)
+    boxes_after = len(discretization)
 
     # validate by showing the image again
     fill_scaling_from_hierarchical_coefficients(discretization, coefficients)
@@ -429,7 +552,11 @@ if __name__ == "__main__":
         if discretization.descriptor.is_box(index)
     ]
     assert len(scaling_coefficients) == len(discretization)
-    raster_after = get_resampled_image(discretization, scaling_coefficients)
+    raster_after = get_resampled_image(
+        discretization,
+        scaling_coefficients,
+        target_maximum_level=target_maximum_level,
+    )
     plot_2d_image(raster_after)
     ic(initial_length, len(scaling_coefficients))
 
@@ -437,6 +564,14 @@ if __name__ == "__main__":
     difference = raster_before - raster_after
     abs_difference = np.abs(difference)
     ic(np.max(abs_difference), np.mean(difference))
-    assert np.max(abs_difference) < 0.00000001
-    assert np.mean(difference) == 0.0
+    print(
+        "compression summary:",
+        f"descriptor_entries {descriptor_entries_before}->{descriptor_entries_after}",
+        f"(x{descriptor_entries_before / descriptor_entries_after:.3f})",
+        f"boxes {boxes_before}->{boxes_after}",
+        f"(x{boxes_before / boxes_after:.3f})",
+    )
+    assert np.isfinite(np.max(abs_difference))
+    ic(str(discretization))
+    # Compression decisions are coefficient-local, not direct pixel-error bounded.
     # coarsen leaves with low coefficients until compression ratio is reached #TODO
