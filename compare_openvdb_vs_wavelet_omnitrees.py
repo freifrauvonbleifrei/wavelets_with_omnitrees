@@ -18,6 +18,7 @@ try:
         transform_to_all_wavelet_coefficients,
         fill_scaling_from_hierarchical_coefficients,
         compress_by_omnitree_coarsening,
+        compress_by_pushdown_coarsening,
     )
 except ModuleNotFoundError:
     from thingies_with_wavelets_and_omnitrees import (  # type: ignore
@@ -29,6 +30,7 @@ except ModuleNotFoundError:
         transform_to_all_wavelet_coefficients,
         fill_scaling_from_hierarchical_coefficients,
         compress_by_omnitree_coarsening,
+        compress_by_pushdown_coarsening,
     )
 
 
@@ -43,12 +45,17 @@ def midpoint_occupancy_openvdb(inside_fn, level: int) -> vdb.BoolGrid:
         for j in range(dims):
             for k in range(dims):
                 midpoint = np.array(
-                    [(i + 0.5) * voxel_size, (j + 0.5) * voxel_size, (k + 0.5) * voxel_size],
+                    [
+                        (i + 0.5) * voxel_size,
+                        (j + 0.5) * voxel_size,
+                        (k + 0.5) * voxel_size,
+                    ],
                     dtype=np.float64,
                 )
                 if inside_fn(midpoint.reshape(1, 3))[0]:
                     acc.setValueOn((i, j, k), True)
     grid.pruneInactive()
+    # grid.prune()
     return grid
 
 
@@ -57,46 +64,76 @@ def run_one(thingy_name: str, inside_fn, level: int):
         dyada.linearization.MortonOrderLinearization(),
         dyada.descriptor.RefinementDescriptor(3, [level, level, level]),
     )
-    full_occupancy = midpoint_occupancy_coefficients(inside_fn, full_discretization)
+    full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
     reference_binary = full_occupancy >= 0.5
 
-    coefficients = transform_to_all_wavelet_coefficients(full_discretization, full_occupancy)
+    coefficients = transform_to_all_wavelet_coefficients(
+        full_discretization, full_occupancy
+    )
     root_scaling = coefficients[0][0]
     for coeff in coefficients:
         coeff[0] = np.nan
     coefficients[0][0] = root_scaling
 
-    discretization, coefficients = compress_by_omnitree_coarsening(
+    # ── omnitree (canonical coarsening) ──────────────────────────────────────
+    disc_omni, coeff_omni = compress_by_omnitree_coarsening(
         full_discretization,
         [list(c) for c in coefficients],
         coarsening_threshold=0.0,
     )
-    fill_scaling_from_hierarchical_coefficients(discretization, coefficients)
-    scaling_coefficients = np.array(
+    fill_scaling_from_hierarchical_coefficients(disc_omni, coeff_omni)
+    scaling_omni = np.array(
         [
-            coefficients[i][0]
-            for i in range(len(coefficients))
-            if discretization.descriptor.is_box(i)
+            coeff_omni[i][0]
+            for i in range(len(coeff_omni))
+            if disc_omni.descriptor.is_box(i)
         ]
     )
     reconstructed_binary = binary_values_on_full_grid(
-        full_discretization, discretization, scaling_coefficients
+        full_discretization, disc_omni, scaling_omni
     )
     assert bool(np.array_equal(reconstructed_binary, reference_binary))
 
+    # ── omnitree (pushdown coarsening) ───────────────────────────────────────
+    disc_push, coeff_push = compress_by_pushdown_coarsening(
+        full_discretization,
+        [list(c) for c in coefficients],
+        coarsening_threshold=0.0,
+    )
+    fill_scaling_from_hierarchical_coefficients(disc_push, coeff_push)
+    scaling_push = np.array(
+        [
+            coeff_push[i][0]
+            for i in range(len(coeff_push))
+            if disc_push.descriptor.is_box(i)
+        ]
+    )
+    reconstructed_binary_push = binary_values_on_full_grid(
+        full_discretization, disc_push, scaling_push
+    )
+    assert bool(np.array_equal(reconstructed_binary_push, reference_binary))
+
+    # ── OpenVDB ──────────────────────────────────────────────────────────────
     openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
 
     print(f"\nthingy={thingy_name}, level={level}")
     print(
-        "  openvdb:",
+        "  openvdb: ",
         f"active_voxels={openvdb_grid.activeVoxelCount()}",
         f"leaf_count={openvdb_grid.leafCount()}",
+        f"total_count={openvdb_grid.nonLeafCount()+openvdb_grid.leafCount()}",
         f"mem_usage={openvdb_grid.memUsage()}",
     )
     print(
         "  omnitree:",
-        f"descriptor={len(discretization.descriptor)}",
-        f"boxes={len(discretization)}",
+        f"descriptor={len(disc_omni.descriptor)}",
+        f"boxes={len(disc_omni)}",
+        "exact_match=True",
+    )
+    print(
+        "  pushdown:",
+        f"descriptor={len(disc_push.descriptor)}",
+        f"boxes={len(disc_push)}",
         "exact_match=True",
     )
 

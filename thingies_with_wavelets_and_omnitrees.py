@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse as arg
+import functools
 import numpy as np
 
 from icecream import ic
@@ -59,17 +60,26 @@ THINGIES: dict[str, callable] = {
 }
 
 
+@functools.lru_cache(maxsize=None)
+def get_morton_grid_indices(level: int, num_dimensions: int = 3) -> np.ndarray:
+    num_points = 1 << (level * num_dimensions)
+    morton = np.arange(num_points, dtype=np.uint64)
+    indices = np.zeros((num_points, num_dimensions), dtype=np.int64)
+    for dim in range(num_dimensions):
+        coord = np.zeros(num_points, dtype=np.uint64)
+        for bit in range(level):
+            coord |= ((morton >> (bit * num_dimensions + dim)) & 1) << bit
+        indices[:, dim] = coord.astype(np.int64)
+    return indices
+
+
 def midpoint_occupancy_coefficients(
-    inside_fn, discretization: dyada.discretization.Discretization
+    inside_fn, max_level: int, num_dimensions: int = 3
 ) -> np.ndarray:
-    occupancy = np.zeros(len(discretization), dtype=np.float64)
-    for box_index in range(len(discretization)):
-        interval = dyada.discretization.coordinates_from_box_index(
-            discretization, box_index
-        )
-        midpoint = 0.5 * (interval.lower_bound + interval.upper_bound)
-        occupancy[box_index] = 1.0 if inside_fn(midpoint.reshape(1, 3))[0] else 0.0
-    return occupancy
+    grid_resolution = 1 << max_level
+    grid_indices = get_morton_grid_indices(max_level, num_dimensions)
+    midpoints = (grid_indices.astype(np.float64) + 0.5) / float(grid_resolution)
+    return inside_fn(midpoints).astype(np.float64)
 
 
 def binary_values_on_full_grid(
@@ -77,17 +87,30 @@ def binary_values_on_full_grid(
     compressed_discretization: dyada.discretization.Discretization,
     compressed_scalings: np.ndarray,
 ) -> np.ndarray:
-    full_grid_binary = np.zeros(len(full_discretization), dtype=bool)
-    for box_index in range(len(full_discretization)):
+    max_levels = full_discretization.descriptor.get_maximum_level().astype(np.int64)
+    assert np.all(max_levels == max_levels[0]), "expected isotropic full grid"
+    max_level = int(max_levels[0])
+    grid_resolution = 1 << max_level
+
+    dense_binary = np.zeros(
+        (grid_resolution, grid_resolution, grid_resolution), dtype=bool
+    )
+    for box_index in range(len(compressed_discretization)):
         interval = dyada.discretization.coordinates_from_box_index(
-            full_discretization, box_index
+            compressed_discretization, box_index
         )
-        midpoint = 0.5 * (interval.lower_bound + interval.upper_bound)
-        compressed_box_index = compressed_discretization.get_containing_box(midpoint)
-        if isinstance(compressed_box_index, tuple):
-            compressed_box_index = min(compressed_box_index)
-        full_grid_binary[box_index] = compressed_scalings[compressed_box_index] >= 0.5
-    return full_grid_binary
+        lower_idx = np.rint(interval.lower_bound * grid_resolution).astype(np.int64)
+        upper_idx = np.rint(interval.upper_bound * grid_resolution).astype(np.int64)
+        dense_binary[
+            lower_idx[0] : upper_idx[0],
+            lower_idx[1] : upper_idx[1],
+            lower_idx[2] : upper_idx[2],
+        ] = compressed_scalings[box_index] >= 0.5
+
+    morton_indices = get_morton_grid_indices(max_level, num_dimensions=3)
+    return dense_binary[
+        morton_indices[:, 0], morton_indices[:, 1], morton_indices[:, 2]
+    ]
 
 
 def run_for_thingy(thingy_name: str, inside_fn, max_level: int):
@@ -95,9 +118,7 @@ def run_for_thingy(thingy_name: str, inside_fn, max_level: int):
         dyada.linearization.MortonOrderLinearization(),
         dyada.descriptor.RefinementDescriptor(3, [max_level, max_level, max_level]),
     )
-    fully_resolved_occupancy = midpoint_occupancy_coefficients(
-        inside_fn, full_discretization
-    )
+    fully_resolved_occupancy = midpoint_occupancy_coefficients(inside_fn, max_level, 3)
 
     all_coefficients = transform_to_all_wavelet_coefficients(
         full_discretization, fully_resolved_occupancy
