@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
+"""Compare OpenVDB vs omnitree canonical coarsening vs pushdown (mnl=F / mnl=T)."""
+
 import argparse as arg
+import copy
 import numpy as np
 import openvdb as vdb
 
@@ -7,7 +10,6 @@ import dyada
 import dyada.descriptor
 import dyada.discretization
 import dyada.linearization
-
 try:
     from wavelets_with_omnitrees.thingies_with_wavelets_and_omnitrees import (
         THINGIES,
@@ -55,8 +57,20 @@ def midpoint_occupancy_openvdb(inside_fn, level: int) -> vdb.BoolGrid:
                 if inside_fn(midpoint.reshape(1, 3))[0]:
                     acc.setValueOn((i, j, k), True)
     grid.pruneInactive()
-    # grid.prune()
     return grid
+
+
+def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
+    """Recover scalings, reconstruct binary grid, return (desc, boxes, exact)."""
+    coeff = copy.deepcopy(coeff)
+    fill_scaling_from_hierarchical_coefficients(disc, coeff)
+    scaling = np.array(
+        [coeff[i][0] for i in range(len(coeff)) if disc.descriptor.is_box(i)],
+        dtype=np.float32,
+    )
+    recon = binary_values_on_full_grid(full_disc, disc, scaling)
+    exact = bool(np.array_equal(recon, reference_binary))
+    return len(disc.descriptor), len(disc), exact, recon
 
 
 def run_one(thingy_name: str, inside_fn, level: int):
@@ -75,47 +89,51 @@ def run_one(thingy_name: str, inside_fn, level: int):
         coeff[0] = np.nan
     coefficients[0][0] = root_scaling
 
-    # ── omnitree (canonical coarsening) ──────────────────────────────────────
-    disc_omni, coeff_omni = compress_by_omnitree_coarsening(
-        full_discretization,
-        [list(c) for c in coefficients],
-        coarsening_threshold=0.0,
-    )
-    fill_scaling_from_hierarchical_coefficients(disc_omni, coeff_omni)
-    scaling_omni = np.array(
-        [
-            coeff_omni[i][0]
-            for i in range(len(coeff_omni))
-            if disc_omni.descriptor.is_box(i)
-        ]
-    )
-    reconstructed_binary = binary_values_on_full_grid(
-        full_discretization, disc_omni, scaling_omni
-    )
-    assert bool(np.array_equal(reconstructed_binary, reference_binary))
+    results = {}
+    reconstructions = {}
 
-    # ── omnitree (pushdown coarsening) ───────────────────────────────────────
-    disc_push, coeff_push = compress_by_pushdown_coarsening(
+    # ── omnitree (canonical coarsening) ──────────────────────────────────────
+    disc, coeff = compress_by_omnitree_coarsening(
         full_discretization,
         [list(c) for c in coefficients],
         coarsening_threshold=0.0,
     )
-    fill_scaling_from_hierarchical_coefficients(disc_push, coeff_push)
-    scaling_push = np.array(
-        [
-            coeff_push[i][0]
-            for i in range(len(coeff_push))
-            if disc_push.descriptor.is_box(i)
-        ]
+    nd, nb, exact, recon = reconstruct_and_check(
+        full_discretization, disc, coeff, reference_binary
     )
-    reconstructed_binary_push = binary_values_on_full_grid(
-        full_discretization, disc_push, scaling_push
+    results["canonical"] = (nd, nb, exact)
+    reconstructions["canonical"] = recon
+
+    # ── pushdown mnl=False ───────────────────────────────────────────────────
+    disc, coeff = compress_by_pushdown_coarsening(
+        full_discretization,
+        [list(c) for c in coefficients],
+        coarsening_threshold=0.0,
+        merge_non_leaf=False,
     )
-    assert bool(np.array_equal(reconstructed_binary_push, reference_binary))
+    nd, nb, exact, recon = reconstruct_and_check(
+        full_discretization, disc, coeff, reference_binary
+    )
+    results["push(mnl=F)"] = (nd, nb, exact)
+    reconstructions["push(mnl=F)"] = recon
+
+    # ── pushdown mnl=True ────────────────────────────────────────────────────
+    disc, coeff = compress_by_pushdown_coarsening(
+        full_discretization,
+        [list(c) for c in coefficients],
+        coarsening_threshold=0.0,
+        merge_non_leaf=True,
+    )
+    nd, nb, exact, recon = reconstruct_and_check(
+        full_discretization, disc, coeff, reference_binary
+    )
+    results["push(mnl=T)"] = (nd, nb, exact)
+    reconstructions["push(mnl=T)"] = recon
 
     # ── OpenVDB ──────────────────────────────────────────────────────────────
     openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
 
+    # ── Print ────────────────────────────────────────────────────────────────
     print(f"\nthingy={thingy_name}, level={level}")
     print(
         "  openvdb: ",
@@ -124,18 +142,27 @@ def run_one(thingy_name: str, inside_fn, level: int):
         f"total_count={openvdb_grid.nonLeafCount()+openvdb_grid.leafCount()}",
         f"mem_usage={openvdb_grid.memUsage()}",
     )
-    print(
-        "  omnitree:",
-        f"descriptor={len(disc_omni.descriptor)}",
-        f"boxes={len(disc_omni)}",
-        "exact_match=True",
-    )
-    print(
-        "  pushdown:",
-        f"descriptor={len(disc_push.descriptor)}",
-        f"boxes={len(disc_push)}",
-        "exact_match=True",
-    )
+    print(f"  {'method':18s}  {'desc':>6}  {'boxes':>6}  exact_match")
+    print("  " + "-" * 50)
+    for label, (nd, nb, ok) in results.items():
+        print(f"  {label:18s}  {nd:6d}  {nb:6d}  {ok}")
+
+    # ── Assertions ───────────────────────────────────────────────────────────
+    for label, recon in reconstructions.items():
+        assert np.array_equal(recon, reference_binary), (
+            f"{thingy_name} level={level} {label}: "
+            f"reconstruction does not match reference"
+        )
+
+    labels = list(reconstructions.keys())
+    for i in range(len(labels)):
+        for j in range(i + 1, len(labels)):
+            assert np.array_equal(
+                reconstructions[labels[i]], reconstructions[labels[j]]
+            ), (
+                f"{thingy_name} level={level}: "
+                f"{labels[i]} and {labels[j]} reconstructions differ"
+            )
 
 
 if __name__ == "__main__":

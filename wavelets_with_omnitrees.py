@@ -2,14 +2,12 @@
 import argparse as arg
 import bitarray as ba
 import bitarray.util
-import cProfile
 from functools import lru_cache
 import matplotlib.pyplot as plt
 import math
 import numpy as np
 import numpy.typing as npt
 from icecream import ic
-from itertools import product
 from PIL import Image
 from typing import Callable, Optional, Sequence
 
@@ -377,7 +375,9 @@ def compress_by_omnitree_coarsening(
                 if matching_old_indices
                 else mapped_from_sorted[0]
             )
-            new_coefficients[new_index] = current_coefficients[first_found_old_index]
+            new_coefficients[new_index] = list(
+                current_coefficients[first_found_old_index]
+            )
             if first_found_old_index not in final_markers:
                 continue
             marker = final_markers[first_found_old_index]
@@ -494,6 +494,166 @@ def pushdown_single_node_coefficients(
         [float(scalings[r]), float(details[r])] for r in range(n_rem_slots)
     ]
     return new_parent_coeffs, intermediate_coeffs
+
+
+def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
+    """Compute the coefficient array index for a subset of global dims within ref.
+
+    Given a subset of global dimensions (as a bitarray) and a refinement bitarray,
+    return the integer index into the coefficient array (of length 2^|ref|) that
+    corresponds to that subset.
+    """
+    ref_dims = get_refined_dimensions_desc(ref)  # local ordering of dims in ref
+    k = ref.count()
+    bits = ba.bitarray(k)
+    bits.setall(0)
+    for local_i, global_dim in enumerate(ref_dims):
+        if global_dims_set[global_dim]:
+            bits[local_i] = 1
+    return bitarray.util.ba2int(bits)
+
+
+def unpushdown_coefficients(
+    parent_coeffs: Sequence[float],
+    parent_ref: ba.bitarray,
+    children_coeffs: list[Sequence[float]],
+    children_refs: ba.bitarray | list[ba.bitarray],
+    absorbed_dims: ba.bitarray,
+) -> tuple[list[float], list[list[list[float]]]]:
+    """Wavelet-space normalization: absorb dims from children into parent.
+
+    Given parent with ref R_p and 2^|R_p| children, where absorbed_dims D is
+    the set of dims shared by ALL children but not in R_p, produce:
+    - Merged parent coefficients for ref R_p ∪ D (length 2^|R_p ∪ D|).
+    - For each original child j: a list of 2^|D| sub-child coefficient arrays,
+      each of length 2^|R_c_j \\ D|, indexed by D-position in Morton order.
+
+    children_refs can be a single bitarray (all children have the same ref) or
+    a list of bitarrays (one per child, allowing heterogeneous refs).  All
+    children must have the absorbed_dims bits set.
+
+    No scaling coefficients are ever used; this is purely wavelet-space arithmetic.
+    """
+    k_parent = parent_ref.count()
+    n_parent_children = 1 << k_parent if k_parent > 0 else 1
+    merged_ref = parent_ref | absorbed_dims
+    k_merged = merged_ref.count()
+    k_absorbed = absorbed_dims.count()
+    n_absorbed_slots = 1 << k_absorbed
+    ndim = len(parent_ref)
+
+    # Normalize children_refs to a list
+    if isinstance(children_refs, ba.bitarray):
+        per_child_ref = [children_refs] * n_parent_children
+    else:
+        per_child_ref = children_refs
+
+    assert len(children_coeffs) == n_parent_children
+    absorbed_dims_list = get_refined_dimensions_desc(absorbed_dims)
+
+    # ── Merged parent coefficients ──────────────────────────────────────────
+    merged_coeffs = [np.nan] * (1 << k_merged)
+    parent_dims_list = get_refined_dimensions_desc(parent_ref)
+
+    for t2_int in range(n_absorbed_slots):
+        # Build T₂ as a global-dim bitarray
+        t2_bits_local = bitarray.util.int2ba(t2_int, length=k_absorbed)
+        t2_global = ba.bitarray(ndim)
+        t2_global.setall(0)
+        for local_i, global_dim in enumerate(absorbed_dims_list):
+            if t2_bits_local[local_i]:
+                t2_global[global_dim] = 1
+
+        if t2_int == 0:
+            # T₂ = ∅: fiber is the parent's existing coefficients
+            fiber = list(parent_coeffs)
+        else:
+            # Collect w_{T₂} from each child, using that child's own ref
+            raw_fiber = []
+            for j in range(n_parent_children):
+                child_t2_index = _subset_index_in_ref(t2_global, per_child_ref[j])
+                raw_fiber.append(float(children_coeffs[j][child_t2_index]))
+            # Forward Haar (hierarchize)
+            fiber = list(
+                np.matmul(hierarchization_matrix(k_parent), raw_fiber, dtype=np.float64)
+            )
+
+        # Place fiber entries into merged_coeffs
+        for t1_int in range(1 << k_parent if k_parent > 0 else 1):
+            t1_bits_local = (
+                bitarray.util.int2ba(t1_int, length=k_parent)
+                if k_parent > 0
+                else ba.bitarray()
+            )
+            t1_global = ba.bitarray(ndim)
+            t1_global.setall(0)
+            for local_i, global_dim in enumerate(parent_dims_list):
+                if t1_bits_local[local_i]:
+                    t1_global[global_dim] = 1
+
+            # T = T₁ ∪ T₂ in merged ref
+            t_global = t1_global | t2_global
+            merged_index = _subset_index_in_ref(t_global, merged_ref)
+            merged_coeffs[merged_index] = fiber[t1_int]
+
+    # ── Split child coefficient arrays ──────────────────────────────────────
+    # For each child mⱼ, split into 2^|D| sub-children by applying |D|-dim
+    # inverse Haar per remaining-dim fiber (per child's own ref).
+    nod_matrix = nodalization_matrix(k_absorbed)  # 2^|D| × 2^|D|
+
+    split_children: list[list[list[float]]] = []
+    for j in range(n_parent_children):
+        child_c = children_coeffs[j]
+        child_ref_j = per_child_ref[j]
+        remaining_child_ref = child_ref_j.copy()
+        for d in range(ndim):
+            if absorbed_dims[d]:
+                remaining_child_ref[d] = 0
+        k_remaining = remaining_child_ref.count()
+        n_remaining_slots = 1 << k_remaining if k_remaining > 0 else 1
+        remaining_dims_list = get_refined_dimensions_desc(remaining_child_ref)
+
+        # Build a (2^|D| × n_remaining_slots) tensor
+        tensor = np.zeros((n_absorbed_slots, n_remaining_slots), dtype=np.float64)
+        for td_int in range(n_absorbed_slots):
+            td_bits_local = bitarray.util.int2ba(td_int, length=k_absorbed)
+            td_global = ba.bitarray(ndim)
+            td_global.setall(0)
+            for local_i, global_dim in enumerate(absorbed_dims_list):
+                if td_bits_local[local_i]:
+                    td_global[global_dim] = 1
+
+            for tr_int in range(n_remaining_slots):
+                tr_bits_local = (
+                    bitarray.util.int2ba(tr_int, length=k_remaining)
+                    if k_remaining > 0
+                    else ba.bitarray()
+                )
+                tr_global = ba.bitarray(ndim)
+                tr_global.setall(0)
+                for local_i, global_dim in enumerate(remaining_dims_list):
+                    if tr_bits_local[local_i]:
+                        tr_global[global_dim] = 1
+
+                t_global = td_global | tr_global
+                child_index = _subset_index_in_ref(t_global, child_ref_j)
+                tensor[td_int, tr_int] = float(child_c[child_index])
+
+        # Apply inverse Haar in D-dims
+        sub_values = np.matmul(nod_matrix, tensor, dtype=np.float64)
+
+        sub_children_for_j: list[list[float]] = []
+        for d_int in range(n_absorbed_slots):
+            sub_coeffs = [np.nan] * n_remaining_slots
+            for tr_int in range(n_remaining_slots):
+                sub_coeffs[tr_int] = float(sub_values[d_int, tr_int])
+            # Restore NaN at scaling slot
+            sub_coeffs[0] = np.nan
+            sub_children_for_j.append(sub_coeffs)
+
+        split_children.append(sub_children_for_j)
+
+    return merged_coeffs, split_children
 
 
 def _merged_node_coefficients(
@@ -683,7 +843,10 @@ def compress_by_pushdown_coarsening(
                     k_child = child_ref.count()
                     if k_child <= 1:
                         # Regular (non-merged) intermediate or leaf: use pushdown result.
-                        new_coefficients[child_start] = interm_coeffs[r]
+                        # Restore NaN convention for the scaling slot (index 0).
+                        ic = list(interm_coeffs[r])
+                        ic[0] = np.nan
+                        new_coefficients[child_start] = ic
                         merged_new_indices.add(child_start)
                     else:
                         # Merged non-leaf: compute directly in wavelet space.
@@ -744,110 +907,270 @@ def compress_by_pushdown_coarsening(
                 p.plan_coarsening(desc_index, ba.bitarray(current_ref))
                 planned_any = True
 
+        if planned_any:
+            old_disc = discretization
+            discretization, coarsen_mapping = p.apply_refinements(
+                track_mapping="patches", sweep_mode="canonical"
+            )
+            final_markers = p._markers
+            new_coefficients = [[np.nan] for _ in range(len(discretization.descriptor))]
+            inverted_mapping: dict[int, set[int]] = {}
+            for old_index, mapped_to in enumerate(coarsen_mapping):
+                for new_index in mapped_to:
+                    inverted_mapping.setdefault(new_index, set()).add(old_index)
+            for new_index, mapped_from in inverted_mapping.items():
+                expected_num_ref = discretization.descriptor[new_index].count()
+                expected_len = 1 if expected_num_ref == 0 else (1 << expected_num_ref)
+                mapped_from_sorted = sorted(mapped_from)
+                matching = [
+                    oi
+                    for oi in mapped_from_sorted
+                    if len(coefficients[oi]) == expected_len
+                ]
+                first_found = matching[0] if matching else mapped_from_sorted[0]
+                if first_found not in final_markers:
+                    new_coefficients[new_index] = list(coefficients[first_found])
+                    continue
+                marker = final_markers[first_found]
+                if not np.any(marker < 0):
+                    new_coefficients[new_index] = list(coefficients[first_found])
+                    continue
+                # Coarsened node: drop the detail coefficients for coarsened dims
+                # directly from the parent's existing wavelet coefficients.
+                num_ref = old_disc.descriptor[first_found].count()
+                refined_dimensions_desc = get_refined_dimensions_desc(
+                    old_disc.descriptor[first_found]
+                )
+                delete_indices: set[int] = set()
+                for d_i in range(num_dimensions):
+                    if marker[d_i] >= 0:
+                        continue
+                    local_bit_index = get_local_bit_index(
+                        d_i, refined_dimensions_desc
+                    )
+                    delete_indices.update(
+                        get_numbers_with_ith_bit_set(local_bit_index, num_ref)
+                    )
+                new_coefficients[new_index] = list(
+                    np.delete(
+                        arr=coefficients[first_found], obj=sorted(delete_indices)
+                    )
+                )
+            coefficients = new_coefficients
+
+        # ── Normalization round ──────────────────────────────────────────
+        # After pushdown + coarsening the tree may contain uniqueness
+        # violations (1-D intermediates whose children all share a dimension
+        # the parent doesn't have).  Fix them by applying the inverse of the
+        # pushdown formula purely in wavelet space, and use
+        # normalize_discretization for structural resolution.
+        #
+        # Violations may be nested (inner violation parents are children of
+        # outer violation parents).  Compute transforms bottom-up (inner
+        # first) so that outer transforms use the inner-merged coefficients
+        # and refs, matching the simultaneous structural resolution.
+        violations = dyada.descriptor.find_uniqueness_violations(
+            discretization.descriptor
+        )
+        if violations:
+            # Build violation parent→children map.
+            violation_map: dict[int, list[int]] = {}
+            for violation in violations:
+                sorted_v = sorted(violation)
+                violation_map[sorted_v[0]] = sorted_v[1:]
+
+            # Sort violations into levels (inner-most first).
+            violation_levels: list[dict[int, list[int]]] = []
+            remaining_violations = dict(violation_map)
+            while remaining_violations:
+                leaf_level = {
+                    phi: ch
+                    for phi, ch in remaining_violations.items()
+                    if all(ci not in remaining_violations for ci in ch)
+                }
+                assert leaf_level, "No leaf-level violations found"
+                violation_levels.append(leaf_level)
+                for phi in leaf_level:
+                    del remaining_violations[phi]
+
+            # Working copies: track effective coefficients and refs as
+            # inner transforms are applied.
+            working_coeffs: dict[int, list[float]] = {}
+            effective_refs: dict[int, ba.bitarray] = {}
+            for phi, children_hi in violation_map.items():
+                if phi not in working_coeffs:
+                    working_coeffs[phi] = list(coefficients[phi])
+                    effective_refs[phi] = ba.bitarray(
+                        discretization.descriptor[phi]
+                    )
+                for ci in children_hi:
+                    if ci not in working_coeffs:
+                        working_coeffs[ci] = list(coefficients[ci])
+                        effective_refs[ci] = ba.bitarray(
+                            discretization.descriptor[ci]
+                        )
+
+            # Compute transforms bottom-up.
+            all_transforms: dict = {}
+            for level_violations in violation_levels:
+                for parent_hi, children_hi in level_violations.items():
+                    parent_ref = effective_refs[parent_hi]
+                    child_refs = [effective_refs[ci] for ci in children_hi]
+                    common_child_ref = child_refs[0].copy()
+                    for cr in child_refs[1:]:
+                        common_child_ref &= cr
+                    absorbed_dims = common_child_ref & ~parent_ref
+                    merged_ref = parent_ref | absorbed_dims
+
+                    merged_coeffs, split_children = unpushdown_coefficients(
+                        working_coeffs[parent_hi],
+                        parent_ref,
+                        [working_coeffs[ci] for ci in children_hi],
+                        child_refs,
+                        absorbed_dims,
+                    )
+                    child_map = {}
+                    for idx, ci in enumerate(children_hi):
+                        remaining = child_refs[idx].copy()
+                        for d in range(num_dimensions):
+                            if absorbed_dims[d]:
+                                remaining[d] = 0
+                        child_map[ci] = (split_children[idx], absorbed_dims, remaining)
+
+                    all_transforms[parent_hi] = (
+                        merged_coeffs,
+                        merged_ref,
+                        child_map,
+                    )
+
+                    # Update working state for outer levels.
+                    working_coeffs[parent_hi] = list(merged_coeffs)
+                    effective_refs[parent_hi] = merged_ref
+                    for ci, (_, _, remaining) in child_map.items():
+                        effective_refs[ci] = remaining
+
+            # Structural resolution via normalize_discretization.
+            old_disc = discretization
+            discretization, norm_mapping, _ = (
+                dyada.refinement.normalize_discretization(
+                    discretization, track_mapping="patches"
+                )
+            )
+            linearization = discretization._linearization
+
+            # Build inverse mapping: new_index → set of old_indices.
+            inv_map: dict[int, set[int]] = {}
+            for old_i, new_set in enumerate(norm_mapping):
+                for ni in new_set:
+                    inv_map.setdefault(ni, set()).add(old_i)
+
+            # Collect all old indices involved in violations.
+            violation_involved: set[int] = set()
+            for phi, children_hi in violation_map.items():
+                violation_involved.add(phi)
+                violation_involved.update(children_hi)
+
+            # Place coefficients at new positions.
+            new_coefficients: list = [
+                [np.nan] for _ in range(len(discretization.descriptor))
+            ]
+            assigned: set[int] = set()
+
+            # Pass 1: merged parents (only outermost — those not consumed
+            # as children of a higher-level violation).
+            consumed_parents: set[int] = set()
+            for phi, children_hi in violation_map.items():
+                for ci in children_hi:
+                    if ci in all_transforms:
+                        consumed_parents.add(ci)
+
+            for parent_hi, (
+                merged_coeffs,
+                merged_ref,
+                child_map,
+            ) in all_transforms.items():
+                if parent_hi in consumed_parents:
+                    continue
+                for ni in norm_mapping[parent_hi]:
+                    new_ref = ba.bitarray(discretization.descriptor[ni])
+                    if new_ref == merged_ref:
+                        new_coefficients[ni] = list(merged_coeffs)
+                        assigned.add(ni)
+
+            # Pass 2: split children → sub-child coefficient arrays.
+            # Use the effective remaining_child_ref (which accounts for
+            # inner merges) so the ref matches the structural result.
+            for _, (_, _, child_map) in all_transforms.items():
+                for child_hi, (sub_list, abs_dims, remaining_child_ref) in child_map.items():
+                    candidate_new = [
+                        ni
+                        for ni in norm_mapping[child_hi]
+                        if ni not in assigned
+                    ]
+                    if not candidate_new:
+                        continue
+
+                    # If children dissolve (remaining ref = 0), sub-children
+                    # are leaves with [nan] — the default is correct.
+                    if remaining_child_ref.count() == 0:
+                        continue
+
+                    # Match sub-children to new positions by spatial location
+                    # in the absorbed dims.
+                    k_abs = abs_dims.count()
+                    abs_dims_list = get_refined_dimensions_desc(abs_dims)
+
+                    old_branch, _ = old_disc.descriptor.get_branch(
+                        child_hi, is_box_index=False
+                    )
+                    old_loc = dyada.discretization.branch_to_location_code(
+                        old_branch, linearization
+                    )
+
+                    for ni in candidate_new:
+                        new_ref = ba.bitarray(discretization.descriptor[ni])
+                        if new_ref != remaining_child_ref:
+                            continue
+                        new_branch, _ = discretization.descriptor.get_branch(
+                            ni, is_box_index=False
+                        )
+                        new_loc = dyada.discretization.branch_to_location_code(
+                            new_branch, linearization
+                        )
+                        d_position = ba.bitarray(k_abs)
+                        d_position.setall(0)
+                        for local_i, gdim in enumerate(abs_dims_list):
+                            new_bits = new_loc[gdim]
+                            old_bits = old_loc[gdim]
+                            if len(new_bits) > len(old_bits):
+                                d_position[local_i] = new_bits[-1]
+                        d_int = bitarray.util.ba2int(d_position)
+                        new_coefficients[ni] = list(sub_list[d_int])
+                        assigned.add(ni)
+
+            # Pass 3: uninvolved nodes (1:1 copy from old).
+            for ni in range(len(discretization.descriptor)):
+                if ni in assigned:
+                    continue
+                old_sources = inv_map.get(ni, set())
+                if not old_sources:
+                    continue
+                uninvolved_sources = sorted(
+                    oi for oi in old_sources if oi not in violation_involved
+                )
+                new_ref = ba.bitarray(discretization.descriptor[ni])
+                new_len = (
+                    1 if new_ref.count() == 0 else (1 << new_ref.count())
+                )
+                for oi in uninvolved_sources:
+                    if len(coefficients[oi]) == new_len:
+                        new_coefficients[ni] = list(coefficients[oi])
+                        break
+
+            coefficients = new_coefficients
+
         if not planned_any:
             break
-
-        old_disc = discretization
-        discretization, coarsen_mapping = p.apply_refinements(
-            track_mapping="patches", sweep_mode="canonical"
-        )
-        final_markers = p._markers
-        new_coefficients = [[np.nan] for _ in range(len(discretization.descriptor))]
-        inverted_mapping: dict[int, set[int]] = {}
-        for old_index, mapped_to in enumerate(coarsen_mapping):
-            for new_index in mapped_to:
-                inverted_mapping.setdefault(new_index, set()).add(old_index)
-        for new_index, mapped_from in inverted_mapping.items():
-            expected_num_ref = discretization.descriptor[new_index].count()
-            expected_len = 1 if expected_num_ref == 0 else (1 << expected_num_ref)
-            mapped_from_sorted = sorted(mapped_from)
-            matching = [
-                oi for oi in mapped_from_sorted if len(coefficients[oi]) == expected_len
-            ]
-            first_found = matching[0] if matching else mapped_from_sorted[0]
-            if first_found not in final_markers:
-                new_coefficients[new_index] = coefficients[first_found]
-                continue
-            marker = final_markers[first_found]
-            if not np.any(marker < 0):
-                new_coefficients[new_index] = coefficients[first_found]
-                continue
-            # Coarsened node: drop the detail coefficients for coarsened dims
-            # directly from the parent's existing wavelet coefficients.
-            # No intermediate point values needed (haar_on_pushdown.tex eq. 3).
-            num_ref = old_disc.descriptor[first_found].count()
-            refined_dimensions_desc = get_refined_dimensions_desc(
-                old_disc.descriptor[first_found]
-            )
-            delete_indices: set[int] = set()
-            for d_i in range(num_dimensions):
-                if marker[d_i] >= 0:
-                    continue
-                local_bit_index = get_local_bit_index(d_i, refined_dimensions_desc)
-                delete_indices.update(
-                    get_numbers_with_ith_bit_set(local_bit_index, num_ref)
-                )
-            new_coefficients[new_index] = list(
-                np.delete(arr=coefficients[first_found], obj=sorted(delete_indices))
-            )
-        coefficients = new_coefficients
-
-    # ── Normalize: pull all splits up as far as possible ─────────────────────
-    # After the pushdown-coarsening loop the tree may contain 1-D intermediate
-    # nodes whose siblings all share the same refinement dimension.  Normalizing
-    # merges those back up so every split lives as high as possible in the tree
-    # (the canonical omnitree form).  The wavelet coefficients are recomputed
-    # from scratch by filling leaf scalings and re-hierarchising on the
-    # normalized descriptor.
-
-    # Extract leaf scalings from wavelet coefficients via top-down dehierarchization.
-    # Leaf scalings (index 0) may be NaN from the wavelet convention, so we
-    # compute them by propagating the root scaling through the tree.
-    old_leaf_scalings = np.full(len(discretization), np.nan, dtype=np.float32)
-    for desc_i, (branch, ref) in enumerate(
-        dyada.descriptor.branch_generator(discretization.descriptor)
-    ):
-        if ref.count() > 0:
-            coeff_arr = list(coefficients[desc_i])
-            # The scaling (index 0) may be NaN; dehierarchize needs all values.
-            # If scaling is NaN, the result will be NaN. This happens when the
-            # parent hasn't propagated a scaling yet—skip and let the parent do it.
-            if not np.isnan(coeff_arr[0]):
-                scaling_vals = dehierarchize(coeff_arr, ref.count())
-                children = discretization.descriptor.get_children(
-                    desc_i, branch_to_parent=branch
-                )
-                for child_pos, child_idx in enumerate(children):
-                    coefficients[child_idx][0] = scaling_vals[child_pos]
-        if discretization.descriptor.is_box(desc_i):
-            box_i = discretization.descriptor.to_box_index(desc_i)
-            old_leaf_scalings[box_i] = coefficients[desc_i][0]
-
-    # Normalize the descriptor (pull shared splits upward).
-    discretization, norm_box_mapping, _ = dyada.refinement.normalize_discretization(
-        discretization, track_mapping="boxes"
-    )
-
-    # Map old leaf scalings to new box order.
-    if norm_box_mapping:
-        new_leaf_scalings = np.full(len(discretization), np.nan, dtype=np.float32)
-        for old_box_i, new_box_set in enumerate(norm_box_mapping):
-            for new_box_j in new_box_set:
-                new_leaf_scalings[new_box_j] = old_leaf_scalings[old_box_i]
-    else:
-        # No normalization needed — leaf scalings are unchanged.
-        new_leaf_scalings = old_leaf_scalings
-
-    # Recompute all wavelet coefficients on the normalized descriptor.
-    coefficients = transform_to_all_wavelet_coefficients(
-        discretization, new_leaf_scalings
-    )
-
-    # nan-scaling (scaling stored only at root).
-    base_scaling = coefficients[0][0]
-    for c in coefficients:
-        c[0] = np.nan
-    coefficients[0][0] = base_scaling
 
     return discretization, coefficients
 
