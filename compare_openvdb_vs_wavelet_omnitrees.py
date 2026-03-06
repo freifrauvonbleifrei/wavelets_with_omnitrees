@@ -145,13 +145,15 @@ def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
     )
     recon = binary_values_on_full_grid(full_disc, disc, scaling)
     exact = bool(np.array_equal(recon, reference_binary))
-    return len(disc.descriptor), len(disc), exact, recon
+    assert exact
+    return len(disc.descriptor), len(disc), recon
 
 
 def run_one(thingy_name: str, inside_fn, level: int):
+    dimensionality = 3
     full_discretization = dyada.discretization.Discretization(
         dyada.linearization.MortonOrderLinearization(),
-        dyada.descriptor.RefinementDescriptor(3, [level, level, level]),
+        dyada.descriptor.RefinementDescriptor(dimensionality, [level, level, level]),
     )
     full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
     reference_binary = full_occupancy >= 0.5
@@ -173,10 +175,11 @@ def run_one(thingy_name: str, inside_fn, level: int):
         [list(c) for c in coefficients],
         coarsening_threshold=0.0,
     )
-    nd, nb, exact, recon = reconstruct_and_check(
+    nd, nb, recon = reconstruct_and_check(
         full_discretization, disc, coeff, reference_binary
     )
-    results["canonical"] = (nd, nb, exact)
+    topology_bits = nd * dimensionality
+    results["canonical"] = (topology_bits, nb)
     reconstructions["canonical"] = recon
 
     # ── pushdown mnl=False ───────────────────────────────────────────────────
@@ -184,43 +187,38 @@ def run_one(thingy_name: str, inside_fn, level: int):
         full_discretization,
         [list(c) for c in coefficients],
         coarsening_threshold=0.0,
-        merge_non_leaf=False,
     )
-    nd, nb, exact, recon = reconstruct_and_check(
+    nd, nb, recon = reconstruct_and_check(
         full_discretization, disc, coeff, reference_binary
     )
-    results["push(mnl=F)"] = (nd, nb, exact)
+    topology_bits = nd * dimensionality
+    results["push(mnl=F)"] = (topology_bits, nb)
     reconstructions["push(mnl=F)"] = recon
-
-    # ── pushdown mnl=True ────────────────────────────────────────────────────
-    disc, coeff = compress_by_pushdown_coarsening(
-        full_discretization,
-        [list(c) for c in coefficients],
-        coarsening_threshold=0.0,
-        merge_non_leaf=True,
-    )
-    nd, nb, exact, recon = reconstruct_and_check(
-        full_discretization, disc, coeff, reference_binary
-    )
-    results["push(mnl=T)"] = (nd, nb, exact)
-    reconstructions["push(mnl=T)"] = recon
 
     # ── OpenVDB ──────────────────────────────────────────────────────────────
     openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
+    openvdb_stats = openvdb_topology_bits(openvdb_grid)
+    results["openvdb"] = (
+        openvdb_stats["inside"]["total_topology_bits"],
+        openvdb_stats["inside"]["dense_value_bytes"],
+    )
+    # ic(openvdb_stats)
 
     # ── Print ────────────────────────────────────────────────────────────────
     print(f"\nthingy={thingy_name}, level={level}")
+    # print(
+    #     "  openvdb: ",
+    #     f"active_voxels={openvdb_grid.activeVoxelCount()}",
+    #     f"leaf_count={openvdb_grid.leafCount()}",
+    #     f"topology_bits={openvdb_stats['inside']['total_topology_bits']}",
+    #     f"value_bytes={openvdb_stats['inside']['dense_value_bytes']}",
+    # )
     print(
-        "  openvdb: ",
-        f"active_voxels={openvdb_grid.activeVoxelCount()}",
-        f"leaf_count={openvdb_grid.leafCount()}",
-        f"total_count={openvdb_grid.nonLeafCount()+openvdb_grid.leafCount()}",
-        f"mem_usage={openvdb_grid.memUsage()}",
+        f"  {'method':18s}  {'topology bits':>6}  {'value bits':>6}  {'total bits':>6}"
     )
-    print(f"  {'method':18s}  {'desc':>6}  {'boxes':>6}  exact_match")
     print("  " + "-" * 50)
-    for label, (nd, nb, ok) in results.items():
-        print(f"  {label:18s}  {nd:6d}  {nb:6d}  {ok}")
+    for label, (nt, nb) in results.items():
+        print(f"  {label:18s}  {(nt):6d}  {nb:6d} {(nt+nb):6d} ")
 
     # ── Assertions ───────────────────────────────────────────────────────────
     for label, recon in reconstructions.items():
