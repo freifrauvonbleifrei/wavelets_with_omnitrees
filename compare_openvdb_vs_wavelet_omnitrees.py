@@ -3,13 +3,19 @@
 
 import argparse as arg
 import copy
+from icecream import ic
+import json
 import numpy as np
 import openvdb as vdb
+from pathlib import Path
+import subprocess
+from collections import defaultdict
 
 import dyada
 import dyada.descriptor
 import dyada.discretization
 import dyada.linearization
+
 try:
     from wavelets_with_omnitrees.thingies_with_wavelets_and_omnitrees import (
         THINGIES,
@@ -34,6 +40,75 @@ except ModuleNotFoundError:
         compress_by_omnitree_coarsening,
         compress_by_pushdown_coarsening,
     )
+
+
+# this function courtesy of claude
+def openvdb_topology_bits(vdb_grid, grid_name: str | None = None) -> dict:
+    """
+    Returns a dict keyed by grid name. Each value contains:
+      {
+        "levels": [
+          {
+            "level": int,
+            "type": str,          # e.g. "Leaf_8", "Internal_16", "Internal_32"
+            "nodes": int,
+            "mask_bits_per_node": int,
+            "total_bits": int,
+          },
+          ...
+        ],
+        "total_topology_bits":  int,
+        "total_topology_bytes": int,
+      }
+
+    Mask bits counted:
+      Leaf nodes:     value mask only            (8^3  = 512 bits)
+      Internal nodes: child mask + value mask    (16^3 = 8192 bits, 32^3 = 65536 bits)
+      Root node:      excluded (sparse hash map, implementation-specific)
+    Pointer storage, padding, and value arrays are excluded throughout.
+    """
+    vdb_file = "./tmp.vdb"
+    vdb.write(vdb_file, grids=[vdb_grid])
+    bin = Path(__file__).parent / "vdb_topology_bits"
+    cmd = [str(bin), vdb_file]
+    if grid_name:
+        cmd.append(grid_name)
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"vdb_topology_bits failed:\n{result.stderr}")
+
+    grids: dict = defaultdict(lambda: {"levels": []})
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        obj = json.loads(line)
+        name = obj["grid"]
+        if "summary" in obj:
+            grids[name]["total_topology_bits"] = obj["total_topology_bits"]
+            grids[name]["total_topology_bytes"] = obj["total_topology_bytes"]
+        elif "value_summary" in obj:
+            grids[name]["bits_per_value"] = obj["bits_per_value"]
+            grids[name]["active_leaf_voxels"] = obj["active_leaf_voxels"]
+            grids[name]["active_tiles"] = obj["active_tiles"]
+            grids[name]["dense_value_bits"] = obj["dense_value_bits"]
+            grids[name]["dense_value_bytes"] = obj["dense_value_bytes"]
+            grids[name]["active_value_bits"] = obj["active_value_bits"]
+            grids[name]["active_value_bytes"] = obj["active_value_bytes"]
+        else:
+            grids[name]["levels"].append(
+                {
+                    "level": obj["level"],
+                    "type": obj["type"],
+                    "nodes": obj["nodes"],
+                    "mask_bits_per_node": obj["mask_bits_per_node"],
+                    "total_bits": obj["total_bits"],
+                }
+            )
+
+    return dict(grids)
 
 
 def midpoint_occupancy_openvdb(inside_fn, level: int) -> vdb.BoolGrid:
