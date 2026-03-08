@@ -132,25 +132,72 @@ def fill_scaling_from_hierarchical_coefficients(
     coefficients: Sequence[Optional[Sequence[np.float32]]],
 ):
     # fills in the scaling coefficients from the hierarchical coefficients
-    # iterate from the top down
-    for i_c, (branch, refinement) in enumerate(
-        dyada.descriptor.branch_generator(discretization.descriptor)
-    ):
-        coeff_array = coefficients[i_c]
-        assert coeff_array is not None
-        assert coeff_array[0] is not None
-        num_refined_dimensions = refinement.count()
-        scaling_coefficients = dehierarchize(coeff_array, num_refined_dimensions)
-        # assign the scaling coefficients to the children
-        children_indices = discretization.descriptor.get_children(
-            i_c, branch_to_parent=branch
-        )
-        for i_child, child_index in enumerate(children_indices):
-            assert coefficients[child_index] is not None
-            assert coefficients[child_index][0] is None or np.isnan(
-                coefficients[child_index][0]
+    # iterate forward, using a stack instead of branch_generator + get_children
+    descriptor = discretization.descriptor
+    # Stack entries: [scaling_coefficients, child_counter, num_children]
+    parent_stack: list = []
+
+    for desc_i in range(len(descriptor)):
+        # If this node has a parent on the stack, assign its scaling coefficient
+        if parent_stack:
+            p = parent_stack[-1]
+            assert coefficients[desc_i] is not None
+            assert coefficients[desc_i][0] is None or np.isnan(
+                coefficients[desc_i][0]
             )
-            coefficients[child_index][0] = scaling_coefficients[i_child]
+            coefficients[desc_i][0] = p[0][p[1]]
+            p[1] += 1
+
+        ref = descriptor[desc_i]
+        num_ref = ref.count()
+        if num_ref > 0:
+            coeff_array = coefficients[desc_i]
+            assert coeff_array is not None
+            assert coeff_array[0] is not None
+            scaling = dehierarchize(coeff_array, num_ref)
+            parent_stack.append([scaling, 0, 1 << num_ref])
+        else:
+            # Leaf: pop completed parents
+            while parent_stack and parent_stack[-1][1] == parent_stack[-1][2]:
+                parent_stack.pop()
+
+
+def _compute_node_levels(
+    descriptor: dyada.descriptor.RefinementDescriptor,
+) -> list[npt.NDArray[np.int8]]:
+    """Pre-compute per-dimension level for every descriptor node in a single forward pass.
+
+    Returns a list where levels[i] is the per-dimension level array for node i.
+    Avoids branch_generator and get_level_from_branch entirely.
+    """
+    num_dims = descriptor.get_num_dimensions()
+    n = len(descriptor)
+    levels: list[npt.NDArray[np.int8]] = [None] * n  # type: ignore
+    current_level = np.zeros(num_dims, dtype=np.int8)
+    # Stack entries: [remaining_children, saved_parent_level]
+    stack: list = []
+
+    for i in range(n):
+        ref = descriptor[i]
+        levels[i] = current_level
+
+        if ref.count() > 0:
+            # Parent: save current level, compute child level
+            child_level = current_level + np.array(
+                [int(ref[d]) for d in range(num_dims)], dtype=np.int8
+            )
+            stack.append([1 << ref.count(), current_level])
+            current_level = child_level
+        else:
+            # Leaf: advance — pop completed parents
+            while stack:
+                stack[-1][0] -= 1
+                if stack[-1][0] > 0:
+                    break
+                current_level = stack[-1][1]
+                stack.pop()
+
+    return levels
 
 
 def read_img_file(filename: str) -> npt.NDArray[np.float16]:
@@ -290,56 +337,62 @@ def compress_by_omnitree_coarsening(
     ]:
         p = dyada.refinement.PlannedAdaptiveRefinement(current_discretization)
         planned_any = False
+        descriptor = current_discretization.descriptor
+        node_levels = _compute_node_levels(descriptor)
 
-        for descriptor_index, (branch, current_refinement) in enumerate(
-            dyada.descriptor.branch_generator(current_discretization.descriptor)
-        ):
+        # Backwards iteration: children are visited before parents,
+        # so the stack naturally provides children indices at each parent.
+        stack: list[int] = []  # stack of descriptor indices
+        desc_i = len(descriptor) - 1
+        for current_refinement in reversed(descriptor):
             num_refinements = current_refinement.count()
-            if num_refinements < 1:
+            if num_refinements == 0:
+                stack.append(desc_i)
+                desc_i -= 1
                 continue
+
+            num_children = 1 << num_refinements
+            children_indices = [stack.pop() for _ in range(num_children)]
 
             # Coarsening only when all direct children are leaves
-            children_indices = current_discretization.descriptor.get_children(
-                descriptor_index, branch_to_parent=branch
-            )
-            if any(len(current_coefficients[c]) > 1 for c in children_indices):
-                continue
+            if not any(
+                len(current_coefficients[c]) > 1 for c in children_indices
+            ):
+                parent_coefficients = current_coefficients[desc_i]
+                branch_level = node_levels[desc_i].astype(np.int64)
+                box_volume = float(np.prod(np.power(2.0, -branch_level)))
+                local_bound = phase_threshold * box_volume
 
-            parent_coefficients = current_coefficients[descriptor_index]
-            branch_level = dyada.descriptor.get_level_from_branch(branch).astype(
-                np.int64
-            )
-            box_volume = float(np.prod(np.power(2.0, -branch_level)))
-            local_bound = phase_threshold * box_volume
+                if abs(parent_coefficients[-1]) <= local_bound:
+                    if sum(abs(v) for v in parent_coefficients[1:]) <= local_bound:
+                        coarsen_mask = ba.bitarray(descriptor[desc_i])
+                        p.plan_coarsening(desc_i, coarsen_mask)
+                        planned_any = True
+                    else:
+                        refined_dimensions_desc = get_refined_dimensions_desc(
+                            current_refinement
+                        )
+                        for global_dimension in refined_dimensions_desc:
+                            local_bit_index = get_local_bit_index(
+                                global_dimension, refined_dimensions_desc
+                            )
+                            hierarchical_indices = get_numbers_with_ith_bit_set(
+                                local_bit_index, num_refinements
+                            )
+                            hierarchical_abs_values = [
+                                abs(parent_coefficients[i_h])
+                                for i_h in hierarchical_indices
+                            ]
+                            if sum(hierarchical_abs_values) <= local_bound:
+                                one_d_refinement = ba.bitarray(
+                                    "0" * num_dimensions
+                                )
+                                one_d_refinement[global_dimension] = 1
+                                p.plan_coarsening(desc_i, one_d_refinement)
+                                planned_any = True
 
-            if abs(parent_coefficients[-1]) > local_bound:
-                continue
-
-            if sum(abs(v) for v in parent_coefficients[1:]) <= local_bound:
-                coarsen_mask = ba.bitarray(
-                    current_discretization.descriptor[descriptor_index]
-                )
-                p.plan_coarsening(descriptor_index, coarsen_mask)
-                planned_any = True
-                continue
-
-            refined_dimensions_desc = get_refined_dimensions_desc(current_refinement)
-            for global_dimension in refined_dimensions_desc:
-                local_bit_index = get_local_bit_index(
-                    global_dimension, refined_dimensions_desc
-                )
-                hierarchical_indices = get_numbers_with_ith_bit_set(
-                    local_bit_index, num_refinements
-                )
-                hierarchical_abs_values = [
-                    abs(parent_coefficients[i_h]) for i_h in hierarchical_indices
-                ]
-                can_partially_coarsen = sum(hierarchical_abs_values) <= local_bound
-                if can_partially_coarsen:
-                    one_d_refinement = ba.bitarray("0" * num_dimensions)
-                    one_d_refinement[global_dimension] = 1
-                    p.plan_coarsening(descriptor_index, one_d_refinement)
-                    planned_any = True
+            stack.append(desc_i)
+            desc_i -= 1
 
         if not planned_any:
             return current_discretization, current_coefficients, False
@@ -704,7 +757,6 @@ def compress_by_pushdown_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
-    merge_non_leaf: bool = True,
 ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
     """Compress via progressive bottom-up pushdown guided by 1D detail coefficients.
 
@@ -714,10 +766,6 @@ def compress_by_pushdown_coarsening(
       2. Coarsen: for every single-dim intermediate whose two children are all leaves,
          coarsen it if its lone detail coefficient is within the local error bound.
     Stop when no coarsenings occur in a round.
-
-    merge_non_leaf: passed to apply_planned_pushdowns.  When True (default), non-leaf
-        sibling pairs that share the same ref are merged into a single multi-dim
-        intermediate.  When False, a 1-D intermediate node is inserted instead.
 
     Merged non-leaf intermediates are computed directly in the wavelet domain.
     """
@@ -731,20 +779,18 @@ def compress_by_pushdown_coarsening(
         # ancestor–descendant pairs in the same batch while being less
         # restrictive than the old frontier check (which required all children
         # to have count() <= 1).
-        candidates: list[tuple[int, ba.bitarray, int]] = (
-            []
-        )  # (desc_index, branch, depth)
-        for desc_index, (branch, current_ref) in enumerate(
-            dyada.descriptor.branch_generator(discretization.descriptor)
-        ):
-            if current_ref.count() < 2:
+        descriptor = discretization.descriptor
+        node_levels = _compute_node_levels(descriptor)
+        candidates: list[tuple[int, int]] = []  # (desc_index, depth)
+        for desc_index in range(len(descriptor)):
+            if descriptor[desc_index].count() < 2:
                 continue
-            depth = int(np.sum(dyada.descriptor.get_level_from_branch(branch)))
-            candidates.append((desc_index, branch, depth))
-        max_depth = max((d for _, _, d in candidates), default=-1)
+            depth = int(np.sum(node_levels[desc_index]))
+            candidates.append((desc_index, depth))
+        max_depth = max((d for _, d in candidates), default=-1)
 
         planned_pushdowns: list[tuple[int, ba.bitarray]] = []
-        for desc_index, branch, depth in candidates:
+        for desc_index, depth in candidates:
             if depth < max_depth:
                 continue
             current_ref = ba.bitarray(discretization.descriptor[desc_index])
@@ -767,7 +813,6 @@ def compress_by_pushdown_coarsening(
                 discretization,
                 planned_pushdowns,
                 track_mapping="patches",
-                merge_non_leaf=merge_non_leaf,
             )
 
             # Update coefficients: copy unchanged nodes, compute new parent + intermediates.
@@ -877,35 +922,39 @@ def compress_by_pushdown_coarsening(
             coefficients = new_coefficients
 
         # ── Coarsening round ────────────────────────────────────────────────
-        # Handle k≥1 nodes: with merge_non_leaf=True, pushdown can create k≥2
-        # merged intermediates whose all-leaf children should be coarsenable.
         p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
         planned_any = False
-        for desc_index, (branch, current_ref) in enumerate(
-            dyada.descriptor.branch_generator(discretization.descriptor)
-        ):
+        # Recompute levels after pushdown may have changed the descriptor.
+        node_levels = _compute_node_levels(discretization.descriptor)
+        # Backwards iteration: children are on the stack when we reach their parent.
+        coarsen_stack: list[int] = []
+        coarsen_desc_i = len(discretization.descriptor) - 1
+        for current_ref in reversed(discretization.descriptor):
             k = current_ref.count()
-            if k < 1:
+            if k == 0:
+                coarsen_stack.append(coarsen_desc_i)
+                coarsen_desc_i -= 1
                 continue
+
+            num_children = 1 << k
+            children_indices = [coarsen_stack.pop() for _ in range(num_children)]
+
             # Only coarsen when ALL children are leaves.
-            children_indices = discretization.descriptor.get_children(
-                desc_index, branch_to_parent=branch
-            )
-            if any(len(coefficients[c]) > 1 for c in children_indices):
-                continue
-            branch_level = dyada.descriptor.get_level_from_branch(branch).astype(
-                np.int64
-            )
-            local_bound = coarsening_threshold * float(
-                np.prod(np.power(2.0, -branch_level))
-            )
-            # For k=1: one detail; for k≥2: all 2^k-1 details must be within bound.
-            if all(
-                abs(coefficients[desc_index][j]) <= local_bound
-                for j in range(1, 1 << k)
-            ):
-                p.plan_coarsening(desc_index, ba.bitarray(current_ref))
-                planned_any = True
+            if not any(len(coefficients[c]) > 1 for c in children_indices):
+                branch_level = node_levels[coarsen_desc_i].astype(np.int64)
+                local_bound = coarsening_threshold * float(
+                    np.prod(np.power(2.0, -branch_level))
+                )
+                # For k=1: one detail; for k≥2: all 2^k-1 details must be within bound.
+                if all(
+                    abs(coefficients[coarsen_desc_i][j]) <= local_bound
+                    for j in range(1, 1 << k)
+                ):
+                    p.plan_coarsening(coarsen_desc_i, ba.bitarray(current_ref))
+                    planned_any = True
+
+            coarsen_stack.append(coarsen_desc_i)
+            coarsen_desc_i -= 1
 
         if planned_any:
             old_disc = discretization

@@ -149,7 +149,7 @@ def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
     return len(disc.descriptor), len(disc), recon
 
 
-def run_one(thingy_name: str, inside_fn, level: int):
+def run_one(thingy_name: str, inside_fn, level: int, output_dir: Path):
     dimensionality = 3
     full_discretization = dyada.discretization.Discretization(
         dyada.linearization.MortonOrderLinearization(),
@@ -168,32 +168,35 @@ def run_one(thingy_name: str, inside_fn, level: int):
 
     results = {}
     reconstructions = {}
+    descriptors = {}
 
     # ── omnitree (canonical coarsening) ──────────────────────────────────────
-    disc, coeff = compress_by_omnitree_coarsening(
+    disc_can, coeff_can = compress_by_omnitree_coarsening(
         full_discretization,
         [list(c) for c in coefficients],
         coarsening_threshold=0.0,
     )
     nd, nb, recon = reconstruct_and_check(
-        full_discretization, disc, coeff, reference_binary
+        full_discretization, disc_can, coeff_can, reference_binary
     )
     topology_bits = nd * dimensionality
     results["canonical"] = (topology_bits, nb)
     reconstructions["canonical"] = recon
+    descriptors["canonical"] = disc_can.descriptor
 
-    # ── pushdown mnl=False ───────────────────────────────────────────────────
-    disc, coeff = compress_by_pushdown_coarsening(
-        full_discretization,
-        [list(c) for c in coefficients],
+    # ── pushdown (starting from canonical) ───────────────────────────────────
+    disc_pd, coeff_pd = compress_by_pushdown_coarsening(
+        disc_can,
+        [list(c) for c in coeff_can],
         coarsening_threshold=0.0,
     )
     nd, nb, recon = reconstruct_and_check(
-        full_discretization, disc, coeff, reference_binary
+        full_discretization, disc_pd, coeff_pd, reference_binary
     )
     topology_bits = nd * dimensionality
-    results["push(mnl=F)"] = (topology_bits, nb)
-    reconstructions["push(mnl=F)"] = recon
+    results["pushdown"] = (topology_bits, nb)
+    reconstructions["pushdown"] = recon
+    descriptors["pushdown"] = disc_pd.descriptor
 
     # ── OpenVDB ──────────────────────────────────────────────────────────────
     openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
@@ -202,23 +205,13 @@ def run_one(thingy_name: str, inside_fn, level: int):
         openvdb_stats["inside"]["total_topology_bits"],
         openvdb_stats["inside"]["dense_value_bytes"],
     )
-    # ic(openvdb_stats)
 
     # ── Print ────────────────────────────────────────────────────────────────
     print(f"\nthingy={thingy_name}, level={level}")
-    # print(
-    #     "  openvdb: ",
-    #     f"active_voxels={openvdb_grid.activeVoxelCount()}",
-    #     f"leaf_count={openvdb_grid.leafCount()}",
-    #     f"topology_bits={openvdb_stats['inside']['total_topology_bits']}",
-    #     f"value_bytes={openvdb_stats['inside']['dense_value_bytes']}",
-    # )
-    print(
-        f"  {'method':18s}  {'topology bits':>6}  {'value bits':>6}  {'total bits':>6}"
-    )
-    print("  " + "-" * 50)
+    print(f"  {'method':<18s} {'topo bits':>10s} {'value bits':>11s} {'total bits':>11s}")
+    print(f"  {'-' * 52}")
     for label, (nt, nb) in results.items():
-        print(f"  {label:18s}  {(nt):6d}  {nb:6d} {(nt+nb):6d} ")
+        print(f"  {label:<18s} {nt:10d} {nb:11d} {nt + nb:11d}")
 
     # ── Assertions ───────────────────────────────────────────────────────────
     for label, recon in reconstructions.items():
@@ -237,6 +230,15 @@ def run_one(thingy_name: str, inside_fn, level: int):
                 f"{labels[i]} and {labels[j]} reconstructions differ"
             )
 
+    # ── Write descriptor and VDB files ───────────────────────────────────────
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{thingy_name}_l{level}"
+    for label, desc in descriptors.items():
+        desc.to_file(str(output_dir / f"{prefix}_{label}"))
+    vdb_path = str(output_dir / f"{prefix}_openvdb.vdb")
+    vdb.write(vdb_path, grids=[openvdb_grid])
+    print(f"  wrote descriptors and VDB to {output_dir}/")
+
 
 if __name__ == "__main__":
     parser = arg.ArgumentParser()
@@ -247,11 +249,18 @@ if __name__ == "__main__":
         default="all",
         choices=["all", "sphere", "tetrahedron", "diagonal_rod"],
     )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="output",
+        help="directory for descriptor and VDB files",
+    )
     args = parser.parse_args()
 
     selected = THINGIES.items()
     if args.thingy != "all":
         selected = [(args.thingy, THINGIES[args.thingy])]
 
+    output_dir = Path(args.output_dir)
     for thingy_name, inside_fn in selected:
-        run_one(thingy_name, inside_fn, level=args.level)
+        run_one(thingy_name, inside_fn, level=args.level, output_dir=output_dir)
