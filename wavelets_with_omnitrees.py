@@ -142,9 +142,7 @@ def fill_scaling_from_hierarchical_coefficients(
         if parent_stack:
             p = parent_stack[-1]
             assert coefficients[desc_i] is not None
-            assert coefficients[desc_i][0] is None or np.isnan(
-                coefficients[desc_i][0]
-            )
+            assert coefficients[desc_i][0] is None or np.isnan(coefficients[desc_i][0])
             coefficients[desc_i][0] = p[0][p[1]]
             p[1] += 1
 
@@ -355,9 +353,7 @@ def compress_by_omnitree_coarsening(
             children_indices = [stack.pop() for _ in range(num_children)]
 
             # Coarsening only when all direct children are leaves
-            if not any(
-                len(current_coefficients[c]) > 1 for c in children_indices
-            ):
+            if not any(len(current_coefficients[c]) > 1 for c in children_indices):
                 parent_coefficients = current_coefficients[desc_i]
                 branch_level = node_levels[desc_i].astype(np.int64)
                 box_volume = float(np.prod(np.power(2.0, -branch_level)))
@@ -384,9 +380,7 @@ def compress_by_omnitree_coarsening(
                                 for i_h in hierarchical_indices
                             ]
                             if sum(hierarchical_abs_values) <= local_bound:
-                                one_d_refinement = ba.bitarray(
-                                    "0" * num_dimensions
-                                )
+                                one_d_refinement = ba.bitarray("0" * num_dimensions)
                                 one_d_refinement[global_dimension] = 1
                                 p.plan_coarsening(desc_i, one_d_refinement)
                                 planned_any = True
@@ -926,7 +920,9 @@ def compress_by_pushdown_coarsening(
         planned_any = False
         # Recompute levels after pushdown may have changed the descriptor.
         node_levels = _compute_node_levels(discretization.descriptor)
-        # Backwards iteration: children are on the stack when we reach their parent.
+
+        # Backwards iteration: children are visited before parents,
+        # so the stack naturally provides children indices at each parent.
         coarsen_stack: list[int] = []
         coarsen_desc_i = len(discretization.descriptor) - 1
         for current_ref in reversed(discretization.descriptor):
@@ -939,13 +935,12 @@ def compress_by_pushdown_coarsening(
             num_children = 1 << k
             children_indices = [coarsen_stack.pop() for _ in range(num_children)]
 
-            # Only coarsen when ALL children are leaves.
+            # Coarsen only when all direct children are leaves.
             if not any(len(coefficients[c]) > 1 for c in children_indices):
                 branch_level = node_levels[coarsen_desc_i].astype(np.int64)
                 local_bound = coarsening_threshold * float(
                     np.prod(np.power(2.0, -branch_level))
                 )
-                # For k=1: one detail; for k≥2: all 2^k-1 details must be within bound.
                 if all(
                     abs(coefficients[coarsen_desc_i][j]) <= local_bound
                     for j in range(1, 1 << k)
@@ -994,16 +989,12 @@ def compress_by_pushdown_coarsening(
                 for d_i in range(num_dimensions):
                     if marker[d_i] >= 0:
                         continue
-                    local_bit_index = get_local_bit_index(
-                        d_i, refined_dimensions_desc
-                    )
+                    local_bit_index = get_local_bit_index(d_i, refined_dimensions_desc)
                     delete_indices.update(
                         get_numbers_with_ith_bit_set(local_bit_index, num_ref)
                     )
                 new_coefficients[new_index] = list(
-                    np.delete(
-                        arr=coefficients[first_found], obj=sorted(delete_indices)
-                    )
+                    np.delete(arr=coefficients[first_found], obj=sorted(delete_indices))
                 )
             coefficients = new_coefficients
 
@@ -1049,15 +1040,11 @@ def compress_by_pushdown_coarsening(
             for phi, children_hi in violation_map.items():
                 if phi not in working_coeffs:
                     working_coeffs[phi] = list(coefficients[phi])
-                    effective_refs[phi] = ba.bitarray(
-                        discretization.descriptor[phi]
-                    )
+                    effective_refs[phi] = ba.bitarray(discretization.descriptor[phi])
                 for ci in children_hi:
                     if ci not in working_coeffs:
                         working_coeffs[ci] = list(coefficients[ci])
-                        effective_refs[ci] = ba.bitarray(
-                            discretization.descriptor[ci]
-                        )
+                        effective_refs[ci] = ba.bitarray(discretization.descriptor[ci])
 
             # Compute transforms bottom-up.
             all_transforms: dict = {}
@@ -1100,10 +1087,8 @@ def compress_by_pushdown_coarsening(
 
             # Structural resolution via normalize_discretization.
             old_disc = discretization
-            discretization, norm_mapping, _ = (
-                dyada.refinement.normalize_discretization(
-                    discretization, track_mapping="patches"
-                )
+            discretization, norm_mapping, _ = dyada.refinement.normalize_discretization(
+                discretization, track_mapping="patches"
             )
             linearization = discretization._linearization
 
@@ -1150,11 +1135,13 @@ def compress_by_pushdown_coarsening(
             # Use the effective remaining_child_ref (which accounts for
             # inner merges) so the ref matches the structural result.
             for _, (_, _, child_map) in all_transforms.items():
-                for child_hi, (sub_list, abs_dims, remaining_child_ref) in child_map.items():
+                for child_hi, (
+                    sub_list,
+                    abs_dims,
+                    remaining_child_ref,
+                ) in child_map.items():
                     candidate_new = [
-                        ni
-                        for ni in norm_mapping[child_hi]
-                        if ni not in assigned
+                        ni for ni in norm_mapping[child_hi] if ni not in assigned
                     ]
                     if not candidate_new:
                         continue
@@ -1208,9 +1195,7 @@ def compress_by_pushdown_coarsening(
                     oi for oi in old_sources if oi not in violation_involved
                 )
                 new_ref = ba.bitarray(discretization.descriptor[ni])
-                new_len = (
-                    1 if new_ref.count() == 0 else (1 << new_ref.count())
-                )
+                new_len = 1 if new_ref.count() == 0 else (1 << new_ref.count())
                 for oi in uninvolved_sources:
                     if len(coefficients[oi]) == new_len:
                         new_coefficients[ni] = list(coefficients[oi])
