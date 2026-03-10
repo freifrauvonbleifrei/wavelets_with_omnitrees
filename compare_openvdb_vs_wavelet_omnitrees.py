@@ -224,7 +224,21 @@ def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
     return len(disc.descriptor), len(disc), recon
 
 
+def output_files_for(thingy_id: int, level: int, output_dir: Path) -> list[Path]:
+    """Return the list of output files that run_one produces for a given thingy."""
+    prefix = f"{thingy_id}_l{level}"
+    return [
+        output_dir / f"{prefix}_canonical_3d.bin",
+        output_dir / f"{prefix}_pushdown_3d.bin",
+        output_dir / f"{prefix}_openvdb.vdb",
+    ]
+
+
 def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
+    if all(f.exists() for f in output_files_for(thingy_id, level, output_dir)):
+        print(f"  skipping thingy {thingy_id}: all output files exist")
+        return
+
     dimensionality = 3
     full_discretization = dyada.discretization.Discretization(
         dyada.linearization.MortonOrderLinearization(),
