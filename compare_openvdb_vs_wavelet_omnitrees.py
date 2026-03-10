@@ -120,7 +120,7 @@ def load_thingi10k_thingies(
 
 
 # this function courtesy of claude
-def openvdb_topology_bits(vdb_grid, grid_name: str | None = None) -> dict:
+def openvdb_topology_bits(vdb_file: str, grid_name: str | None = None) -> dict:
     """
     Returns a dict keyed by grid name. Each value contains:
       {
@@ -144,8 +144,6 @@ def openvdb_topology_bits(vdb_grid, grid_name: str | None = None) -> dict:
       Root node:      excluded (sparse hash map, implementation-specific)
     Pointer storage, padding, and value arrays are excluded throughout.
     """
-    vdb_file = "./tmp.vdb"
-    vdb.write(vdb_file, grids=[vdb_grid])
     bin = Path(__file__).parent / "vdb_topology_bits"
     cmd = [str(bin), vdb_file]
     if grid_name:
@@ -277,7 +275,11 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
 
     # ── OpenVDB ──────────────────────────────────────────────────────────────
     openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
-    openvdb_stats = openvdb_topology_bits(openvdb_grid)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{thingy_id}_l{level}"
+    vdb_path = str(output_dir / f"{prefix}_openvdb.vdb")
+    vdb.write(vdb_path, grids=[openvdb_grid])
+    openvdb_stats = openvdb_topology_bits(vdb_path)
     results["openvdb"] = (
         openvdb_stats["inside"]["total_topology_bits"],
         openvdb_stats["inside"]["dense_value_bytes"],
@@ -309,13 +311,9 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
                 f"{labels[i]} and {labels[j]} reconstructions differ"
             )
 
-    # ── Write descriptor and VDB files ───────────────────────────────────────
-    output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{thingy_id}_l{level}"
+    # ── Write descriptor files ───────────────────────────────────────────────
     for label, desc in descriptors.items():
         desc.to_file(str(output_dir / f"{prefix}_{label}"))
-    vdb_path = str(output_dir / f"{prefix}_openvdb.vdb")
-    vdb.write(vdb_path, grids=[openvdb_grid])
     print(f"  wrote descriptors and VDB to {output_dir}/")
 
 
