@@ -245,79 +245,154 @@ def output_files_for(thingy_id: int, level: int, output_dir: Path) -> list[Path]
     return files
 
 
-def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
-    if all(f.exists() for f in output_files_for(thingy_id, level, output_dir)):
-        print(f"  skipping thingy {thingy_id}: all output files exist")
-        return
+def _sample_at_leaf_midpoints(
+    discretization: dyada.discretization.Discretization,
+    inside_fn,
+) -> np.ndarray:
+    """Sample inside_fn at the midpoint of each leaf box."""
+    n_boxes = len(discretization)
+    midpoints = np.empty((n_boxes, 3), dtype=np.float64)
+    for box_index in range(n_boxes):
+        interval = dyada.discretization.coordinates_from_box_index(
+            discretization, box_index
+        )
+        midpoints[box_index] = (interval.lower_bound + interval.upper_bound) / 2.0
+    return inside_fn(midpoints).astype(np.float64)
 
-    dimensionality = 3
-    full_discretization = dyada.discretization.Discretization(
-        dyada.linearization.MortonOrderLinearization(),
-        dyada.descriptor.RefinementDescriptor(dimensionality, [level, level, level]),
-    )
-    full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
-    reference_binary = full_occupancy >= 0.5
 
-    coefficients = transform_to_all_wavelet_coefficients(
-        full_discretization, full_occupancy
-    )
+def _hierarchize_on_tree(
+    discretization: dyada.discretization.Discretization,
+    leaf_values: np.ndarray,
+) -> list:
+    """Hierarchize leaf values on an arbitrary tree, returning wavelet coefficients."""
+    coefficients = transform_to_all_wavelet_coefficients(discretization, leaf_values)
     root_scaling = coefficients[0][0]
     for coeff in coefficients:
         coeff[0] = np.nan
     coefficients[0][0] = root_scaling
+    return coefficients
+
+
+def _load_discretization(
+    descriptor_file: Path,
+) -> dyada.discretization.Discretization:
+    """Load a descriptor from file and build a Discretization."""
+    desc = dyada.descriptor.RefinementDescriptor.from_file(str(descriptor_file))
+    return dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(), desc
+    )
+
+
+def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dimensionality = 3
+    prefix = f"{thingy_id}_l{level}"
+
+    canonical_file = output_dir / f"{prefix}_canonical_3d.bin"
+    pushdown_file = output_dir / f"{prefix}_pushdown_3d.bin"
+    level_sweep_file = output_dir / f"{prefix}_level_sweep_3d.bin"
+    vdb_file = output_dir / f"{prefix}_openvdb.vdb"
+
+    need_canonical = not canonical_file.exists()
+    need_pushdown = not pushdown_file.exists()
+    need_level_sweep = not level_sweep_file.exists()
+    need_openvdb = HAS_OPENVDB and not vdb_file.exists()
+
+    if not (need_canonical or need_pushdown or need_level_sweep or need_openvdb):
+        print(f"  skipping thingy {thingy_id}: all output files exist")
+        return
+
+    full_discretization = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(),
+        dyada.descriptor.RefinementDescriptor(dimensionality, [level] * dimensionality),
+    )
 
     results = {}
     reconstructions = {}
     descriptors = {}
 
-    # ── omnitree (canonical coarsening) ──────────────────────────────────────
-    disc_can, coeff_can = compress_by_omnitree_coarsening(
-        full_discretization,
-        [list(c) for c in coefficients],
-        coarsening_threshold=0.0,
-    )
-    nd, nb, recon = reconstruct_and_check(
-        full_discretization, disc_can, coeff_can, reference_binary
-    )
-    topology_bits = nd * dimensionality
-    results["canonical"] = (topology_bits, nb)
-    reconstructions["canonical"] = recon
-    descriptors["canonical"] = disc_can.descriptor
+    # ── Decide how to reconstruct coefficients ───────────────────────────────
+    # Walk the pipeline backwards to find the latest existing result we can
+    # start from, then sample + hierarchize on that tree to reconstruct
+    # wavelet coefficients cheaply (instead of resampling the full grid).
 
-    # ── pushdown (starting from canonical) ───────────────────────────────────
-    disc_pd, coeff_pd = compress_by_pushdown_coarsening(
-        disc_can,
-        [list(c) for c in coeff_can],
-        coarsening_threshold=0.0,
-    )
-    nd, nb, recon = reconstruct_and_check(
-        full_discretization, disc_pd, coeff_pd, reference_binary
-    )
-    topology_bits = nd * dimensionality
-    results["pushdown"] = (topology_bits, nb)
-    reconstructions["pushdown"] = recon
-    descriptors["pushdown"] = disc_pd.descriptor
+    disc_can = coeff_can = None
+    disc_pd = coeff_pd = None
+    reference_binary = None
 
-    # ── level sweep (starting from pushdown) ─────────────────────────────────
-    disc_ls, coeff_ls = compress_by_level_sweep_coarsening(
-        disc_pd,
-        [list(c) for c in coeff_pd],
-        coarsening_threshold=0.0,
-    )
-    nd, nb, recon = reconstruct_and_check(
-        full_discretization, disc_ls, coeff_ls, reference_binary
-    )
-    topology_bits = nd * dimensionality
-    results["level_sweep"] = (topology_bits, nb)
-    reconstructions["level_sweep"] = recon
-    descriptors["level_sweep"] = disc_ls.descriptor
+    def _ensure_reference_binary():
+        nonlocal reference_binary
+        if reference_binary is None:
+            full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
+            reference_binary = full_occupancy >= 0.5
+
+    if need_canonical:
+        # Must start from full grid
+        full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
+        reference_binary = full_occupancy >= 0.5
+        coefficients = _hierarchize_on_tree(full_discretization, full_occupancy)
+
+        disc_can, coeff_can = compress_by_omnitree_coarsening(
+            full_discretization,
+            [list(c) for c in coefficients],
+            coarsening_threshold=0.0,
+        )
+    elif need_pushdown or need_level_sweep:
+        # Canonical exists — load it and sample at its leaf midpoints
+        disc_can = _load_discretization(canonical_file)
+        leaf_values = _sample_at_leaf_midpoints(disc_can, inside_fn)
+        coeff_can = _hierarchize_on_tree(disc_can, leaf_values)
+
+    if need_canonical:
+        _ensure_reference_binary()
+        nd, nb, recon = reconstruct_and_check(
+            full_discretization, disc_can, coeff_can, reference_binary
+        )
+        results["canonical"] = (nd * dimensionality, nb)
+        reconstructions["canonical"] = recon
+        descriptors["canonical"] = disc_can.descriptor
+
+    # ── pushdown ─────────────────────────────────────────────────────────────
+    if need_pushdown:
+        disc_pd, coeff_pd = compress_by_pushdown_coarsening(
+            disc_can,
+            [list(c) for c in coeff_can],
+            coarsening_threshold=0.0,
+        )
+    elif need_level_sweep:
+        # Pushdown exists — load it and sample at its leaf midpoints
+        disc_pd = _load_discretization(pushdown_file)
+        leaf_values = _sample_at_leaf_midpoints(disc_pd, inside_fn)
+        coeff_pd = _hierarchize_on_tree(disc_pd, leaf_values)
+
+    if need_pushdown:
+        _ensure_reference_binary()
+        nd, nb, recon = reconstruct_and_check(
+            full_discretization, disc_pd, coeff_pd, reference_binary
+        )
+        results["pushdown"] = (nd * dimensionality, nb)
+        reconstructions["pushdown"] = recon
+        descriptors["pushdown"] = disc_pd.descriptor
+
+    # ── level sweep ──────────────────────────────────────────────────────────
+    if need_level_sweep:
+        disc_ls, coeff_ls = compress_by_level_sweep_coarsening(
+            disc_pd,
+            [list(c) for c in coeff_pd],
+            coarsening_threshold=0.0,
+        )
+        _ensure_reference_binary()
+        nd, nb, recon = reconstruct_and_check(
+            full_discretization, disc_ls, coeff_ls, reference_binary
+        )
+        results["level_sweep"] = (nd * dimensionality, nb)
+        reconstructions["level_sweep"] = recon
+        descriptors["level_sweep"] = disc_ls.descriptor
 
     # ── OpenVDB ──────────────────────────────────────────────────────────────
-    output_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"{thingy_id}_l{level}"
-    if HAS_OPENVDB:
+    if need_openvdb:
         openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
-        vdb_path = str(output_dir / f"{prefix}_openvdb.vdb")
+        vdb_path = str(vdb_file)
         vdb.write(vdb_path, grids=[openvdb_grid])
         openvdb_stats = openvdb_topology_bits(vdb_path)
         results["openvdb"] = (
@@ -326,13 +401,14 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         )
 
     # ── Print ────────────────────────────────────────────────────────────────
-    print(f"\nthingy={thingy_id}, level={level}")
-    print(
-        f"  {'method':<18s} {'topo bits':>10s} {'value bits':>11s} {'total bits':>11s}"
-    )
-    print(f"  {'-' * 52}")
-    for label, (nt, nb) in results.items():
-        print(f"  {label:<18s} {nt:10d} {nb:11d} {nt + nb:11d}")
+    if results:
+        print(f"\nthingy={thingy_id}, level={level}")
+        print(
+            f"  {'method':<18s} {'topo bits':>10s} {'value bits':>11s} {'total bits':>11s}"
+        )
+        print(f"  {'-' * 52}")
+        for label, (nt, nb) in results.items():
+            print(f"  {label:<18s} {nt:10d} {nb:11d} {nt + nb:11d}")
 
     # ── Assertions ───────────────────────────────────────────────────────────
     for label, recon in reconstructions.items():
@@ -354,7 +430,8 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     # ── Write descriptor files ───────────────────────────────────────────────
     for label, desc in descriptors.items():
         desc.to_file(str(output_dir / f"{prefix}_{label}"))
-    print(f"  wrote descriptors{' and VDB' if HAS_OPENVDB else ''} to {output_dir}/")
+    if descriptors:
+        print(f"  wrote descriptors to {output_dir}/")
 
 
 if __name__ == "__main__":
