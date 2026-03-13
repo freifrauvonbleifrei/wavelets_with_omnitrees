@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 from icecream import ic
 from PIL import Image
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence
 
 import dyada
 import dyada.descriptor
@@ -751,6 +751,8 @@ def compress_by_pushdown_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
+    *,
+    _depth_schedule: Iterable[int] | None = None,
 ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
     """Compress via progressive bottom-up pushdown guided by 1D detail coefficients.
 
@@ -762,10 +764,14 @@ def compress_by_pushdown_coarsening(
     Stop when no coarsenings occur in a round.
 
     Merged non-leaf intermediates are computed directly in the wavelet domain.
+
+    If _depth_schedule is provided, pushdown is applied at each specified depth
+    in order, instead of always targeting the current maximum depth.
     """
     from dyada.pushdown import apply_planned_pushdowns
 
     num_dimensions = discretization.descriptor.get_num_dimensions()
+    _depth_iter = iter(_depth_schedule) if _depth_schedule is not None else None
 
     while True:
         # ── Pushdown round ──────────────────────────────────────────────────
@@ -781,11 +787,18 @@ def compress_by_pushdown_coarsening(
                 continue
             depth = int(np.sum(node_levels[desc_index]))
             candidates.append((desc_index, depth))
-        max_depth = max((d for _, d in candidates), default=-1)
+
+        if _depth_iter is not None:
+            try:
+                target_depth = next(_depth_iter)
+            except StopIteration:
+                break
+        else:
+            target_depth = max((d for _, d in candidates), default=-1)
 
         planned_pushdowns: list[tuple[int, ba.bitarray]] = []
         for desc_index, depth in candidates:
-            if depth < max_depth:
+            if depth != target_depth:
                 continue
             current_ref = ba.bitarray(discretization.descriptor[desc_index])
             # Push the dim with the smallest pure 1D detail coefficient.
@@ -935,8 +948,12 @@ def compress_by_pushdown_coarsening(
             num_children = 1 << k
             children_indices = [coarsen_stack.pop() for _ in range(num_children)]
 
-            # Coarsen only when all direct children are leaves.
-            if not any(len(coefficients[c]) > 1 for c in children_indices):
+            # Coarsen only when all direct children are leaves and the
+            # parent has a complete coefficient vector (normalization may
+            # leave newly created multi-dim nodes with placeholder [nan]).
+            if len(coefficients[coarsen_desc_i]) == (1 << k) and not any(
+                len(coefficients[c]) > 1 for c in children_indices
+            ):
                 branch_level = node_levels[coarsen_desc_i].astype(np.int64)
                 local_bound = coarsening_threshold * float(
                     np.prod(np.power(2.0, -branch_level))
@@ -1002,93 +1019,87 @@ def compress_by_pushdown_coarsening(
         # After pushdown + coarsening the tree may contain uniqueness
         # violations (1-D intermediates whose children all share a dimension
         # the parent doesn't have).  Fix them by applying the inverse of the
-        # pushdown formula purely in wavelet space, and use
-        # normalize_discretization for structural resolution.
+        # pushdown formula purely in wavelet space, then restructure with
+        # marker-based normalization.
         #
-        # Violations may be nested (inner violation parents are children of
-        # outer violation parents).  Compute transforms bottom-up (inner
-        # first) so that outer transforms use the inner-merged coefficients
-        # and refs, matching the simultaneous structural resolution.
-        violations = dyada.descriptor.find_uniqueness_violations(
-            discretization.descriptor
-        )
-        if violations:
+        # Nested violations (where inner violation parents are children of
+        # outer violation parents) are handled by processing one level at a
+        # time: resolve inner-most violations first, place their
+        # coefficients, then re-detect and resolve the next level.  This
+        # ensures the refs produced by structural normalization always match
+        # the coefficient transform expectations.
+        while True:
+            violations = dyada.descriptor.find_uniqueness_violations(
+                discretization.descriptor
+            )
+            if not violations:
+                break
+
             # Build violation parent→children map.
             violation_map: dict[int, list[int]] = {}
             for violation in violations:
                 sorted_v = sorted(violation)
                 violation_map[sorted_v[0]] = sorted_v[1:]
 
-            # Sort violations into levels (inner-most first).
-            violation_levels: list[dict[int, list[int]]] = []
-            remaining_violations = dict(violation_map)
-            while remaining_violations:
-                leaf_level = {
-                    phi: ch
-                    for phi, ch in remaining_violations.items()
-                    if all(ci not in remaining_violations for ci in ch)
-                }
-                assert leaf_level, "No leaf-level violations found"
-                violation_levels.append(leaf_level)
-                for phi in leaf_level:
-                    del remaining_violations[phi]
+            # Find leaf-level violations (inner-most: none of their children
+            # are themselves violation parents).
+            leaf_violations = {
+                phi: ch
+                for phi, ch in violation_map.items()
+                if all(ci not in violation_map for ci in ch)
+            }
 
-            # Working copies: track effective coefficients and refs as
-            # inner transforms are applied.
-            working_coeffs: dict[int, list[float]] = {}
-            effective_refs: dict[int, ba.bitarray] = {}
-            for phi, children_hi in violation_map.items():
-                if phi not in working_coeffs:
-                    working_coeffs[phi] = list(coefficients[phi])
-                    effective_refs[phi] = ba.bitarray(discretization.descriptor[phi])
-                for ci in children_hi:
-                    if ci not in working_coeffs:
-                        working_coeffs[ci] = list(coefficients[ci])
-                        effective_refs[ci] = ba.bitarray(discretization.descriptor[ci])
+            # Compute coefficient transforms for leaf-level violations.
+            level_transforms: dict = {}
+            for parent_hi, children_hi in leaf_violations.items():
+                parent_ref = ba.bitarray(discretization.descriptor[parent_hi])
+                child_refs = [
+                    ba.bitarray(discretization.descriptor[ci]) for ci in children_hi
+                ]
+                common_child_ref = child_refs[0].copy()
+                for cr in child_refs[1:]:
+                    common_child_ref &= cr
+                absorbed_dims = common_child_ref & ~parent_ref
+                merged_ref = parent_ref | absorbed_dims
 
-            # Compute transforms bottom-up.
-            all_transforms: dict = {}
-            for level_violations in violation_levels:
-                for parent_hi, children_hi in level_violations.items():
-                    parent_ref = effective_refs[parent_hi]
-                    child_refs = [effective_refs[ci] for ci in children_hi]
-                    common_child_ref = child_refs[0].copy()
-                    for cr in child_refs[1:]:
-                        common_child_ref &= cr
-                    absorbed_dims = common_child_ref & ~parent_ref
-                    merged_ref = parent_ref | absorbed_dims
+                merged_coeffs, split_children = unpushdown_coefficients(
+                    coefficients[parent_hi],
+                    parent_ref,
+                    [coefficients[ci] for ci in children_hi],
+                    child_refs,
+                    absorbed_dims,
+                )
+                child_map = {}
+                for idx, ci in enumerate(children_hi):
+                    remaining = child_refs[idx].copy()
+                    for d in range(num_dimensions):
+                        if absorbed_dims[d]:
+                            remaining[d] = 0
+                    child_map[ci] = (split_children[idx], absorbed_dims, remaining)
 
-                    merged_coeffs, split_children = unpushdown_coefficients(
-                        working_coeffs[parent_hi],
-                        parent_ref,
-                        [working_coeffs[ci] for ci in children_hi],
-                        child_refs,
-                        absorbed_dims,
-                    )
-                    child_map = {}
-                    for idx, ci in enumerate(children_hi):
-                        remaining = child_refs[idx].copy()
-                        for d in range(num_dimensions):
-                            if absorbed_dims[d]:
-                                remaining[d] = 0
-                        child_map[ci] = (split_children[idx], absorbed_dims, remaining)
+                level_transforms[parent_hi] = (
+                    merged_coeffs,
+                    merged_ref,
+                    child_map,
+                )
 
-                    all_transforms[parent_hi] = (
-                        merged_coeffs,
-                        merged_ref,
-                        child_map,
-                    )
-
-                    # Update working state for outer levels.
-                    working_coeffs[parent_hi] = list(merged_coeffs)
-                    effective_refs[parent_hi] = merged_ref
-                    for ci, (_, _, remaining) in child_map.items():
-                        effective_refs[ci] = remaining
-
-            # Structural resolution via normalize_discretization.
+            # Apply structural normalization for this level's violations
+            # only, using markers directly.
             old_disc = discretization
-            discretization, norm_mapping, _ = dyada.refinement.normalize_discretization(
-                discretization, track_mapping="patches"
+            p_norm = dyada.refinement.PlannedAdaptiveRefinement(discretization)
+            for parent_hi, children_hi in leaf_violations.items():
+                dimensions_to_shift = ~ba.bitarray(discretization.descriptor[parent_hi])
+                for ci in children_hi:
+                    dimensions_to_shift &= discretization.descriptor[ci]
+                dim_shift_array = dyada.descriptor.int8_ndarray_from_iterable(
+                    dimensions_to_shift,
+                )
+                p_norm._markers[parent_hi] += dim_shift_array
+                for ci in children_hi:
+                    p_norm._markers[ci] -= dim_shift_array
+
+            discretization, norm_mapping = p_norm.create_new_discretization(
+                track_mapping="patches"
             )
             linearization = discretization._linearization
 
@@ -1098,9 +1109,9 @@ def compress_by_pushdown_coarsening(
                 for ni in new_set:
                     inv_map.setdefault(ni, set()).add(old_i)
 
-            # Collect all old indices involved in violations.
+            # Collect old indices involved in this level's violations.
             violation_involved: set[int] = set()
-            for phi, children_hi in violation_map.items():
+            for phi, children_hi in leaf_violations.items():
                 violation_involved.add(phi)
                 violation_involved.update(children_hi)
 
@@ -1110,21 +1121,12 @@ def compress_by_pushdown_coarsening(
             ]
             assigned: set[int] = set()
 
-            # Pass 1: merged parents (only outermost — those not consumed
-            # as children of a higher-level violation).
-            consumed_parents: set[int] = set()
-            for phi, children_hi in violation_map.items():
-                for ci in children_hi:
-                    if ci in all_transforms:
-                        consumed_parents.add(ci)
-
+            # Pass 1: merged parents.
             for parent_hi, (
                 merged_coeffs,
                 merged_ref,
                 child_map,
-            ) in all_transforms.items():
-                if parent_hi in consumed_parents:
-                    continue
+            ) in level_transforms.items():
                 for ni in norm_mapping[parent_hi]:
                     new_ref = ba.bitarray(discretization.descriptor[ni])
                     if new_ref == merged_ref:
@@ -1132,9 +1134,7 @@ def compress_by_pushdown_coarsening(
                         assigned.add(ni)
 
             # Pass 2: split children → sub-child coefficient arrays.
-            # Use the effective remaining_child_ref (which accounts for
-            # inner merges) so the ref matches the structural result.
-            for _, (_, _, child_map) in all_transforms.items():
+            for _, (_, _, child_map) in level_transforms.items():
                 for child_hi, (
                     sub_list,
                     abs_dims,
@@ -1203,7 +1203,57 @@ def compress_by_pushdown_coarsening(
 
             coefficients = new_coefficients
 
-        if not planned_any:
+        if _depth_iter is None and not planned_any:
+            break
+
+    return discretization, coefficients
+
+
+def compress_by_level_sweep_coarsening(
+    discretization: dyada.discretization.Discretization,
+    coefficients: list[Sequence[float]],
+    coarsening_threshold: float = 0.0,
+) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
+    """Continue compression from a pushdown result by sweeping lower depths.
+
+    Expects the input to already be the result of compress_by_pushdown_coarsening
+    (i.e., canonical coarsening + default pushdown to convergence).
+    Sweeps remaining multi-dimensional depths (max down to 0), then re-converges
+    with default pushdown.  Repeats until no further improvement.
+
+    This guarantees at least as many boxes are removed as default pushdown alone,
+    since the input already is the pushdown result and this only adds work.
+    """
+    # Sweep remaining multi-dim depths and re-converge
+    while True:
+        descriptor = discretization.descriptor
+        node_levels = _compute_node_levels(descriptor)
+        multi_dim_depths: list[int] = sorted(
+            {
+                int(np.sum(node_levels[i]))
+                for i in range(len(descriptor))
+                if descriptor[i].count() >= 2
+            },
+            reverse=True,
+        )
+        if not multi_dim_depths:
+            break
+
+        old_count = len(discretization)
+        # Push at each remaining multi-dim depth (max down to lowest)
+        discretization, coefficients = compress_by_pushdown_coarsening(
+            discretization,
+            [list(c) for c in coefficients],
+            coarsening_threshold,
+            _depth_schedule=multi_dim_depths,
+        )
+        # Re-converge with default pushdown to exploit any new opportunities
+        discretization, coefficients = compress_by_pushdown_coarsening(
+            discretization,
+            [list(c) for c in coefficients],
+            coarsening_threshold,
+        )
+        if len(discretization) >= old_count:
             break
 
     return discretization, coefficients

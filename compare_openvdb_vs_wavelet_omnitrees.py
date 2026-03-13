@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Compare OpenVDB vs omnitree canonical coarsening vs pushdown (mnl=F / mnl=T)."""
+"""Compare OpenVDB vs omnitree canonical coarsening vs pushdown vs level-sweep."""
 
 import argparse as arg
 import copy
 from icecream import ic
 import json
 import numpy as np
-import openvdb as vdb
 from pathlib import Path
 import subprocess
 from collections import defaultdict
+
+try:
+    import openvdb as vdb
+
+    HAS_OPENVDB = True
+except ImportError:
+    HAS_OPENVDB = False
 
 import dyada
 import dyada.descriptor
@@ -27,6 +33,7 @@ try:
         fill_scaling_from_hierarchical_coefficients,
         compress_by_omnitree_coarsening,
         compress_by_pushdown_coarsening,
+        compress_by_level_sweep_coarsening,
     )
 except ModuleNotFoundError:
     from thingies_with_wavelets_and_omnitrees import (  # type: ignore
@@ -39,6 +46,7 @@ except ModuleNotFoundError:
         fill_scaling_from_hierarchical_coefficients,
         compress_by_omnitree_coarsening,
         compress_by_pushdown_coarsening,
+        compress_by_level_sweep_coarsening,
     )
 
 try:
@@ -186,7 +194,7 @@ def openvdb_topology_bits(vdb_file: str, grid_name: str | None = None) -> dict:
     return dict(grids)
 
 
-def midpoint_occupancy_openvdb(inside_fn, level: int) -> vdb.BoolGrid:
+def midpoint_occupancy_openvdb(inside_fn, level: int):
     voxel_size = 2.0 ** (-level)
     dims = 1 << level
     grid = vdb.BoolGrid(False)
@@ -227,11 +235,14 @@ def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
 def output_files_for(thingy_id: int, level: int, output_dir: Path) -> list[Path]:
     """Return the list of output files that run_one produces for a given thingy."""
     prefix = f"{thingy_id}_l{level}"
-    return [
+    files = [
         output_dir / f"{prefix}_canonical_3d.bin",
         output_dir / f"{prefix}_pushdown_3d.bin",
-        output_dir / f"{prefix}_openvdb.vdb",
+        output_dir / f"{prefix}_level_sweep_3d.bin",
     ]
+    if HAS_OPENVDB:
+        files.append(output_dir / f"{prefix}_openvdb.vdb")
+    return files
 
 
 def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
@@ -287,17 +298,32 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     reconstructions["pushdown"] = recon
     descriptors["pushdown"] = disc_pd.descriptor
 
+    # ── level sweep (starting from pushdown) ─────────────────────────────────
+    disc_ls, coeff_ls = compress_by_level_sweep_coarsening(
+        disc_pd,
+        [list(c) for c in coeff_pd],
+        coarsening_threshold=0.0,
+    )
+    nd, nb, recon = reconstruct_and_check(
+        full_discretization, disc_ls, coeff_ls, reference_binary
+    )
+    topology_bits = nd * dimensionality
+    results["level_sweep"] = (topology_bits, nb)
+    reconstructions["level_sweep"] = recon
+    descriptors["level_sweep"] = disc_ls.descriptor
+
     # ── OpenVDB ──────────────────────────────────────────────────────────────
-    openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = f"{thingy_id}_l{level}"
-    vdb_path = str(output_dir / f"{prefix}_openvdb.vdb")
-    vdb.write(vdb_path, grids=[openvdb_grid])
-    openvdb_stats = openvdb_topology_bits(vdb_path)
-    results["openvdb"] = (
-        openvdb_stats["inside"]["total_topology_bits"],
-        openvdb_stats["inside"]["dense_value_bytes"],
-    )
+    if HAS_OPENVDB:
+        openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
+        vdb_path = str(output_dir / f"{prefix}_openvdb.vdb")
+        vdb.write(vdb_path, grids=[openvdb_grid])
+        openvdb_stats = openvdb_topology_bits(vdb_path)
+        results["openvdb"] = (
+            openvdb_stats["inside"]["total_topology_bits"],
+            openvdb_stats["inside"]["dense_value_bytes"],
+        )
 
     # ── Print ────────────────────────────────────────────────────────────────
     print(f"\nthingy={thingy_id}, level={level}")
@@ -328,7 +354,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     # ── Write descriptor files ───────────────────────────────────────────────
     for label, desc in descriptors.items():
         desc.to_file(str(output_dir / f"{prefix}_{label}"))
-    print(f"  wrote descriptors and VDB to {output_dir}/")
+    print(f"  wrote descriptors{' and VDB' if HAS_OPENVDB else ''} to {output_dir}/")
 
 
 if __name__ == "__main__":
