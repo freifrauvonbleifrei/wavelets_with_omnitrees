@@ -2,7 +2,6 @@
 """Compare OpenVDB vs omnitree canonical coarsening vs pushdown vs level-sweep."""
 
 import argparse as arg
-import copy
 from icecream import ic
 import json
 import numpy as np
@@ -30,7 +29,7 @@ try:
     )
     from wavelets_with_omnitrees.wavelets_with_omnitrees import (
         transform_to_all_wavelet_coefficients,
-        fill_scaling_from_hierarchical_coefficients,
+        get_leaf_scalings,
         compress_by_omnitree_coarsening,
         compress_by_pushdown_coarsening,
         compress_by_level_sweep_coarsening,
@@ -43,7 +42,7 @@ except ModuleNotFoundError:
     )
     from wavelets_with_omnitrees import (  # type: ignore
         transform_to_all_wavelet_coefficients,
-        fill_scaling_from_hierarchical_coefficients,
+        get_leaf_scalings,
         compress_by_omnitree_coarsening,
         compress_by_pushdown_coarsening,
         compress_by_level_sweep_coarsening,
@@ -220,12 +219,7 @@ def midpoint_occupancy_openvdb(inside_fn, level: int):
 
 def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
     """Recover scalings, reconstruct binary grid, return (desc, boxes, exact)."""
-    coeff = copy.deepcopy(coeff)
-    fill_scaling_from_hierarchical_coefficients(disc, coeff)
-    scaling = np.array(
-        [coeff[i][0] for i in range(len(coeff)) if disc.descriptor.is_box(i)],
-        dtype=np.float32,
-    )
+    scaling = get_leaf_scalings(disc, coeff).astype(np.float32)
     recon = binary_values_on_full_grid(full_disc, disc, scaling)
     exact = bool(np.array_equal(recon, reference_binary))
     assert exact
@@ -245,18 +239,26 @@ def output_files_for(thingy_id: int, level: int, output_dir: Path) -> list[Path]
     return files
 
 
-def _sample_at_leaf_midpoints(
+def _sample_at_finest_midpoints(
     discretization: dyada.discretization.Discretization,
     inside_fn,
+    level: int,
 ) -> np.ndarray:
-    """Sample inside_fn at the midpoint of each leaf box."""
+    """Sample inside_fn at a finest-level midpoint within each leaf box.
+
+    For each leaf, uses the lower-bound corner offset by half the finest-level
+    voxel size, so the sample point coincides exactly with one of the
+    finest-level midpoints used during full-grid initialization.
+    """
     n_boxes = len(discretization)
-    midpoints = np.empty((n_boxes, 3), dtype=np.float64)
+    dim = discretization.descriptor.get_num_dimensions()
+    half_voxel = 0.5 / (1 << level)
+    midpoints = np.empty((n_boxes, dim), dtype=np.float64)
     for box_index in range(n_boxes):
         interval = dyada.discretization.coordinates_from_box_index(
             discretization, box_index
         )
-        midpoints[box_index] = (interval.lower_bound + interval.upper_bound) / 2.0
+        midpoints[box_index] = interval.lower_bound + half_voxel
     return inside_fn(midpoints).astype(np.float64)
 
 
@@ -338,9 +340,9 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             coarsening_threshold=0.0,
         )
     elif need_pushdown or need_level_sweep:
-        # Canonical exists — load it and sample at its leaf midpoints
+        # Canonical exists — load and reconstruct coefficients
         disc_can = _load_discretization(canonical_file)
-        leaf_values = _sample_at_leaf_midpoints(disc_can, inside_fn)
+        leaf_values = _sample_at_finest_midpoints(disc_can, inside_fn, level)
         coeff_can = _hierarchize_on_tree(disc_can, leaf_values)
 
     if need_canonical:
@@ -360,9 +362,9 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             coarsening_threshold=0.0,
         )
     elif need_level_sweep:
-        # Pushdown exists — load it and sample at its leaf midpoints
+        # Pushdown exists — load and reconstruct coefficients
         disc_pd = _load_discretization(pushdown_file)
-        leaf_values = _sample_at_leaf_midpoints(disc_pd, inside_fn)
+        leaf_values = _sample_at_finest_midpoints(disc_pd, inside_fn, level)
         coeff_pd = _hierarchize_on_tree(disc_pd, leaf_values)
 
     if need_pushdown:

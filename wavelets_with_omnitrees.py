@@ -160,6 +160,25 @@ def fill_scaling_from_hierarchical_coefficients(
                 parent_stack.pop()
 
 
+def get_leaf_scalings(
+    discretization: dyada.discretization.Discretization,
+    coefficients: list[Sequence[float]],
+) -> npt.NDArray[np.float64]:
+    """Extract per-leaf scaling values from hierarchical coefficients.
+
+    Makes a deep copy of the coefficients, fills in scaling values via
+    dehierarchization, and returns an array of leaf scaling values.
+    """
+    import copy
+
+    coeff = copy.deepcopy(coefficients)
+    fill_scaling_from_hierarchical_coefficients(discretization, coeff)
+    return np.array(
+        [coeff[i][0] for i in range(len(coeff)) if discretization.descriptor.is_box(i)],
+        dtype=np.float64,
+    )
+
+
 def _compute_node_levels(
     descriptor: dyada.descriptor.RefinementDescriptor,
 ) -> list[npt.NDArray[np.int8]]:
@@ -1371,12 +1390,7 @@ if __name__ == "__main__":
     boxes_after = len(discretization)
 
     # validate by showing the image again
-    fill_scaling_from_hierarchical_coefficients(discretization, coefficients)
-    scaling_coefficients = [
-        coefficients[index][0]
-        for index in range(len(coefficients))
-        if discretization.descriptor.is_box(index)
-    ]
+    scaling_coefficients = get_leaf_scalings(discretization, coefficients)
     assert len(scaling_coefficients) == len(discretization)
     raster_after = get_resampled_image(
         discretization,

@@ -10,7 +10,7 @@ import dyada.discretization
 import dyada.linearization
 from wavelets_with_omnitrees import (
     transform_to_all_wavelet_coefficients,
-    fill_scaling_from_hierarchical_coefficients,
+    get_leaf_scalings,
     get_resampled_image,
     compress_by_omnitree_coarsening,
     compress_by_pushdown_coarsening,
@@ -24,6 +24,7 @@ THRESHOLDS = [0.0, 1e-6, 1e-5, 1e-4, 1e-3]
 
 def build_initial_state(image_path: str):
     from PIL import Image
+
     data = np.array(Image.open(image_path).convert("L"), dtype=np.float32) / 255.0
     input_shape = data.shape
     dimensionality = len(input_shape)
@@ -57,21 +58,12 @@ def build_initial_state(image_path: str):
 
 
 def evaluate(discretization, coefficients, raster_orig, target_level, label):
-    disc_copy = discretization
-    coeff_copy = copy.deepcopy(coefficients)
-    fill_scaling_from_hierarchical_coefficients(disc_copy, coeff_copy)
-    scaling = [
-        coeff_copy[i][0]
-        for i in range(len(coeff_copy))
-        if disc_copy.descriptor.is_box(i)
-    ]
-    raster = get_resampled_image(disc_copy, scaling, target_level)
+    scaling = get_leaf_scalings(discretization, coefficients)
+    raster = get_resampled_image(discretization, scaling, target_level)
     max_err = float(np.max(np.abs(raster_orig - raster)))
-    n_desc = len(disc_copy.descriptor)
-    n_boxes = len(disc_copy)
-    print(
-        f"  {label:16s}  desc={n_desc:6d}  boxes={n_boxes:6d}  max_err={max_err:.2e}"
-    )
+    n_desc = len(discretization.descriptor)
+    n_boxes = len(discretization)
+    print(f"  {label:16s}  desc={n_desc:6d}  boxes={n_boxes:6d}  max_err={max_err:.2e}")
     return n_desc, n_boxes, max_err
 
 
