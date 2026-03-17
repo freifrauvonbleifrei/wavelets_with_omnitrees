@@ -94,21 +94,22 @@ def _build_disc_from_descriptor_string(dim, descriptor_string):
     )
 
 
-def _print_disc_ascii_and_tikz(disc, labels, name, tmpdir):
-    """Print ASCII and generate TikZ for a 2D discretization."""
-    print(f"\n=== {name} (ASCII) ===")
-    print(dyada.discretization_to_2d_ascii(disc))
-    old_cwd = os.getcwd()
-    os.chdir(tmpdir)
-    try:
-        dyada.plot_all_boxes_2d(
-            disc,
-            labels=labels,
-            backend="tikz",
-            filename=name,
-        )
-    finally:
-        os.chdir(old_cwd)
+def _plot_tikz(disc, labels, name):
+    dyada.plot_all_boxes_2d(
+        disc,
+        labels=labels,
+        backend="tikz",
+        filename=name,
+    )
+    # reformulate labels to be empty where there is no leaf
+    descriptor = disc.descriptor
+    all_labels = [""] * len(descriptor)
+    leaf_index = 0
+    for index in range(len(descriptor)):
+        if descriptor.is_box(index):
+            all_labels[index] = labels[leaf_index]
+            leaf_index += 1
+    dyada.plot_tree_tikz(disc.descriptor, labels=all_labels, filename=name + "_tree")
 
 
 def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
@@ -141,27 +142,31 @@ def test_2d_no_compression():
     disc = _build_disc_from_descriptor_string(2, "11 00 10 10 00 00 00 00 10 00 00")
     nodal = np.array([0, 0, 1, 1, 1, 0, 1], dtype=np.float64)
     assert len(disc) == 7
+    ascii_before_and_after = """\
+_________________
+|_______|___|___|
+|_______|_|_|___|"""
+    assert dyada.discretization_to_2d_ascii(disc) == ascii_before_and_after
 
-    with tempfile.TemporaryDirectory() as tmp:
-        labels = [str(int(v)) for v in nodal]
-        _print_disc_ascii_and_tikz(disc, labels, "before", tmp)
+    labels = [str(int(v)) for v in nodal]
+    _plot_tikz(disc, labels, "before")
 
-        disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
-            disc, nodal
-        )
+    disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
+        disc, nodal
+    )
 
-        # With threshold=0, no wavelet coefficient is exactly zero,
-        # so the tree should be unchanged through all stages
-        assert len(disc_can) == 7
-        assert len(disc_pd) == 7
-        assert len(disc_ls) == 7
-        assert disc_ls.descriptor._data == disc.descriptor._data
+    # With threshold=0, no wavelet coefficient is exactly zero,
+    # so the tree should be unchanged through all stages
+    assert len(disc_can) == 7
+    assert len(disc_pd) == 7
+    assert len(disc_ls) == 7
+    assert disc_ls.descriptor._data == disc.descriptor._data
 
-        scalings = get_leaf_scalings(disc_ls, coeff_ls)
-        np.testing.assert_array_equal(scalings, nodal)
+    scalings = get_leaf_scalings(disc_ls, coeff_ls)
+    np.testing.assert_array_equal(scalings, nodal)
 
-        _print_disc_ascii_and_tikz(disc_ls, labels, "after", tmp)
-    assert False
+    _plot_tikz(disc_ls, labels, "after")
+    assert dyada.discretization_to_2d_ascii(disc) == ascii_before_and_after
 
 
 def test_2d_pushdown_compresses():
@@ -169,28 +174,40 @@ def test_2d_pushdown_compresses():
     disc = _build_disc_from_descriptor_string(2, "11 10 00 00 00 00 00")
     nodal = np.array([0, 1, 1, 0, 1], dtype=np.float64)
     assert len(disc) == 5
+    assert (
+        dyada.discretization_to_2d_ascii(disc)
+        == """\
+_________
+|___|___|
+|_|_|___|"""
+    )
 
-    with tempfile.TemporaryDirectory() as tmp:
-        labels_before = [str(int(v)) for v in nodal]
-        _print_disc_ascii_and_tikz(disc, labels_before, "before_pd", tmp)
+    labels_before = [str(int(v)) for v in nodal]
+    _plot_tikz(disc, labels_before, "before_pd")
 
-        disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
-            disc, nodal
-        )
+    disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
+        disc, nodal
+    )
 
-        # Canonical coarsening does not change anything
-        assert len(disc_can) == 5
-        # Pushdown merges the right column: 5 → 4 boxes
-        assert len(disc_pd) == 4
-        assert len(disc_ls) == 4
+    # Canonical coarsening does not change anything
+    assert len(disc_can) == 5
+    # Pushdown merges the right column: 5 → 4 boxes
+    assert len(disc_pd) == 4
+    assert len(disc_ls) == 4
+    assert (
+        dyada.discretization_to_2d_ascii(disc_pd)
+        == """\
+_________
+|___|   |
+|_|_|___|"""
+    )
 
-        # Verify leaf scaling values are losslessly preserved
-        scalings = get_leaf_scalings(disc_ls, coeff_ls)
-        np.testing.assert_array_equal(scalings, np.array([0, 1, 0, 1]))
+    # Verify leaf scaling values are losslessly preserved
+    scalings = get_leaf_scalings(disc_ls, coeff_ls)
+    np.testing.assert_array_equal(scalings, np.array([0, 1, 0, 1]))
 
-        labels_after = [str(int(v)) for v in scalings]
-        _print_disc_ascii_and_tikz(disc_ls, labels_after, "after_pd", tmp)
-    assert False
+    labels_after = [str(int(v)) for v in scalings]
+    _plot_tikz(disc_ls, labels_after, "after_pd")
 
 
 class TestReconstructFromFile:
