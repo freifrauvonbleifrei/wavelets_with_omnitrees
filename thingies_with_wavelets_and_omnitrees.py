@@ -13,13 +13,13 @@ import dyada.linearization
 try:
     from wavelets_with_omnitrees.wavelets_with_omnitrees import (
         transform_to_all_wavelet_coefficients,
-        fill_scaling_from_hierarchical_coefficients,
+        get_leaf_scalings,
         compress_by_omnitree_coarsening,
     )
 except ModuleNotFoundError:
     from wavelets_with_omnitrees import (
         transform_to_all_wavelet_coefficients,
-        fill_scaling_from_hierarchical_coefficients,
+        get_leaf_scalings,
         compress_by_omnitree_coarsening,
     )
 
@@ -105,7 +105,9 @@ def binary_values_on_full_grid(
             lower_idx[0] : upper_idx[0],
             lower_idx[1] : upper_idx[1],
             lower_idx[2] : upper_idx[2],
-        ] = compressed_scalings[box_index] >= 0.5
+        ] = (
+            compressed_scalings[box_index] >= 0.5
+        )
 
     morton_indices = get_morton_grid_indices(max_level, num_dimensions=3)
     return dense_binary[
@@ -134,14 +136,7 @@ def run_for_thingy(thingy_name: str, inside_fn, max_level: int):
         coarsening_threshold=0.0,
     )
 
-    fill_scaling_from_hierarchical_coefficients(discretization, coefficients)
-    scaling_coefficients = np.array(
-        [
-            coefficients[index][0]
-            for index in range(len(coefficients))
-            if discretization.descriptor.is_box(index)
-        ]
-    )
+    scaling_coefficients = get_leaf_scalings(discretization, coefficients)
     assert not np.isnan(scaling_coefficients).any()
 
     reference_binary = fully_resolved_occupancy >= 0.5

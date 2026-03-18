@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare OpenVDB vs omnitree canonical coarsening vs pushdown vs level-sweep."""
+"""Compare OpenVDB vs omnitree canonical coarsening vs downsplit vs level-sweep."""
 
 import argparse as arg
 from icecream import ic
@@ -31,7 +31,7 @@ try:
         transform_to_all_wavelet_coefficients,
         get_leaf_scalings,
         compress_by_omnitree_coarsening,
-        compress_by_pushdown_coarsening,
+        compress_by_downsplit_coarsening,
         compress_by_level_sweep_coarsening,
     )
 except ModuleNotFoundError:
@@ -44,7 +44,7 @@ except ModuleNotFoundError:
         transform_to_all_wavelet_coefficients,
         get_leaf_scalings,
         compress_by_omnitree_coarsening,
-        compress_by_pushdown_coarsening,
+        compress_by_downsplit_coarsening,
         compress_by_level_sweep_coarsening,
     )
 
@@ -231,7 +231,7 @@ def output_files_for(thingy_id: int, level: int, output_dir: Path) -> list[Path]
     prefix = f"{thingy_id}_l{level}"
     files = [
         output_dir / f"{prefix}_canonical_3d.bin",
-        output_dir / f"{prefix}_pushdown_3d.bin",
+        output_dir / f"{prefix}_downsplit_3d.bin",
         output_dir / f"{prefix}_level_sweep_3d.bin",
     ]
     if HAS_OPENVDB:
@@ -291,16 +291,16 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     prefix = f"{thingy_id}_l{level}"
 
     canonical_file = output_dir / f"{prefix}_canonical_3d.bin"
-    pushdown_file = output_dir / f"{prefix}_pushdown_3d.bin"
+    downsplit_file = output_dir / f"{prefix}_downsplit_3d.bin"
     level_sweep_file = output_dir / f"{prefix}_level_sweep_3d.bin"
     vdb_file = output_dir / f"{prefix}_openvdb.vdb"
 
     need_canonical = not canonical_file.exists()
-    need_pushdown = not pushdown_file.exists()
+    need_downsplit = not downsplit_file.exists()
     need_level_sweep = not level_sweep_file.exists()
     need_openvdb = HAS_OPENVDB and not vdb_file.exists()
 
-    if not (need_canonical or need_pushdown or need_level_sweep or need_openvdb):
+    if not (need_canonical or need_downsplit or need_level_sweep or need_openvdb):
         print(f"  skipping thingy {thingy_id}: all output files exist")
         return
 
@@ -339,7 +339,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             [list(c) for c in coefficients],
             coarsening_threshold=0.0,
         )
-    elif need_pushdown or need_level_sweep:
+    elif need_downsplit or need_level_sweep:
         # Canonical exists — load and reconstruct coefficients
         disc_can = _load_discretization(canonical_file)
         leaf_values = _sample_at_finest_midpoints(disc_can, inside_fn, level)
@@ -354,27 +354,27 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         reconstructions["canonical"] = recon
         descriptors["canonical"] = disc_can.descriptor
 
-    # ── pushdown ─────────────────────────────────────────────────────────────
-    if need_pushdown:
-        disc_pd, coeff_pd = compress_by_pushdown_coarsening(
+    # ── downsplit ────────────────────────────────────────────────────────────
+    if need_downsplit:
+        disc_pd, coeff_pd = compress_by_downsplit_coarsening(
             disc_can,
             [list(c) for c in coeff_can],
             coarsening_threshold=0.0,
         )
     elif need_level_sweep:
         # Pushdown exists — load and reconstruct coefficients
-        disc_pd = _load_discretization(pushdown_file)
+        disc_pd = _load_discretization(downsplit_file)
         leaf_values = _sample_at_finest_midpoints(disc_pd, inside_fn, level)
         coeff_pd = _hierarchize_on_tree(disc_pd, leaf_values)
 
-    if need_pushdown:
+    if need_downsplit:
         _ensure_reference_binary()
         nd, nb, recon = reconstruct_and_check(
             full_discretization, disc_pd, coeff_pd, reference_binary
         )
-        results["pushdown"] = (nd * dimensionality, nb)
-        reconstructions["pushdown"] = recon
-        descriptors["pushdown"] = disc_pd.descriptor
+        results["downsplit"] = (nd * dimensionality, nb)
+        reconstructions["downsplit"] = recon
+        descriptors["downsplit"] = disc_pd.descriptor
 
     # ── level sweep ──────────────────────────────────────────────────────────
     if need_level_sweep:

@@ -520,12 +520,12 @@ def _one_d_coeff_index(d_local: int, k: int) -> int:
     return bitarray.util.ba2int(bits)
 
 
-def pushdown_single_node_coefficients(
+def downsplit_single_node_coefficients(
     old_coeffs: Sequence[float],
     old_ref: ba.bitarray,
-    pushed_dim: int,
+    down_dim: int,
 ) -> tuple[list[float], list[list[float]]]:
-    """Compute coefficient arrays for the new parent and intermediates after a pushdown.
+    """Compute coefficient arrays for the new parent and intermediates after a downsplit.
 
     Splits the k-dim Haar coefficient vector using the tensor structure:
       C[k_rem, k_d] = old_coeffs[j]   where j encodes (k_rem, k_d) via bit d_local.
@@ -538,7 +538,7 @@ def pushdown_single_node_coefficients(
     k = old_ref.count()
     assert k >= 2
     refined_dims = get_refined_dimensions_desc(old_ref)
-    d_local = get_local_bit_index(pushed_dim, refined_dims)
+    d_local = get_local_bit_index(down_dim, refined_dims)
     n_rem = k - 1
     n_rem_slots = 1 << n_rem
 
@@ -579,7 +579,7 @@ def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
     return bitarray.util.ba2int(bits)
 
 
-def unpushdown_coefficients(
+def reverse_downsplit_coefficients(
     parent_coeffs: Sequence[float],
     parent_ref: ba.bitarray,
     children_coeffs: list[Sequence[float]],
@@ -726,25 +726,25 @@ def _merged_node_coefficients(
     childA_coeffs: Sequence[float],
     childB_coeffs: Sequence[float],
     intermediate_detail: float,
-    pushed_dim: int,
+    down_dim: int,
     merged_ref: ba.bitarray,
 ) -> list[float]:
     """Compute wavelet coefficients for a merged non-leaf intermediate.
 
-    When two non-leaf siblings (childA at pushed_dim=0, childB at pushed_dim=1)
+    When two non-leaf siblings (childA at down_dim=0, childB at down_dim=1)
     share the same refinement and are absorbed into a single merged node, the
     merged node's coefficients follow from the tensor product structure
-    (cf. haar_on_pushdown.tex eq. 3):
+    (cf. haar_on_downsplit.tex eq. 3):
 
         w[j]_merged = 0.5 * (childA[j_child] + (-1)^{j_push} * childB[j_child])
 
     For j_child=0 (children's scaling, which is NaN): the j_push=0 entry is NaN
     (merged scaling, convention), and the j_push=1 entry equals the intermediate's
-    pushed-dim detail (computed by the pushdown formula, always real).
+    split-dim detail (computed by the downsplit formula, always real).
     """
     k_merged = merged_ref.count()
     merged_dims = get_refined_dimensions_desc(merged_ref)
-    d_local_merged = get_local_bit_index(pushed_dim, merged_dims)
+    d_local_merged = get_local_bit_index(down_dim, merged_dims)
 
     merged_coeffs = [np.nan] * (1 << k_merged)
     for j in range(1 << k_merged):
@@ -757,7 +757,7 @@ def _merged_node_coefficients(
         if j_child == 0 and j_push == 0:
             merged_coeffs[j] = np.nan  # scaling — convention
         elif j_child == 0 and j_push == 1:
-            merged_coeffs[j] = intermediate_detail  # from pushdown formula
+            merged_coeffs[j] = intermediate_detail  # from downsplit formula
         else:
             sign = 1 if j_push == 0 else -1
             merged_coeffs[j] = 0.5 * (
@@ -766,17 +766,17 @@ def _merged_node_coefficients(
     return merged_coeffs
 
 
-def compress_by_pushdown_coarsening(
+def compress_by_downsplit_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
     *,
     _depth_schedule: Iterable[int] | None = None,
 ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
-    """Compress via progressive bottom-up pushdown guided by 1D detail coefficients.
+    """Compress via progressive bottom-up downsplit guided by 1D detail coefficients.
 
     Each round:
-      1. Pushdown: for every multi-dim node, push down the dimension whose pure 1D
+      1. Downsplit: for every multi-dim node, split down the dimension whose pure 1D
          detail coefficient (indices 1, 2, 4, … in the Haar vector) is smallest.
       2. Coarsen: for every single-dim intermediate whose two children are all leaves,
          coarsen it if its lone detail coefficient is within the local error bound.
@@ -784,17 +784,17 @@ def compress_by_pushdown_coarsening(
 
     Merged non-leaf intermediates are computed directly in the wavelet domain.
 
-    If _depth_schedule is provided, pushdown is applied at each specified depth
+    If _depth_schedule is provided, downsplit is applied at each specified depth
     in order, instead of always targeting the current maximum depth.
     """
-    from dyada.pushdown import apply_planned_pushdowns
+    from dyada.downsplit import apply_planned_downsplits
 
     num_dimensions = discretization.descriptor.get_num_dimensions()
     _depth_iter = iter(_depth_schedule) if _depth_schedule is not None else None
 
     while True:
-        # ── Pushdown round ──────────────────────────────────────────────────
-        # Push the deepest multi-dim nodes first (by tree depth).  This avoids
+        # ── Downsplit round ─────────────────────────────────────────────────
+        # Split the deepest multi-dim nodes first (by tree depth).  This avoids
         # ancestor–descendant pairs in the same batch while being less
         # restrictive than the old frontier check (which required all children
         # to have count() <= 1).
@@ -815,12 +815,12 @@ def compress_by_pushdown_coarsening(
         else:
             target_depth = max((d for _, d in candidates), default=-1)
 
-        planned_pushdowns: list[tuple[int, ba.bitarray]] = []
+        planned_downsplits: list[tuple[int, ba.bitarray]] = []
         for desc_index, depth in candidates:
             if depth != target_depth:
                 continue
             current_ref = ba.bitarray(discretization.descriptor[desc_index])
-            # Push the dim with the smallest pure 1D detail coefficient.
+            # Split the dim with the smallest pure 1D detail coefficient.
             k = current_ref.count()
             refined_dims = get_refined_dimensions_desc(current_ref)
             best_dim, best_score = refined_dims[0], float("inf")
@@ -831,28 +831,28 @@ def compress_by_pushdown_coarsening(
                     best_score, best_dim = score, global_dim
             dims_ba = ba.bitarray(discretization.descriptor.d_zeros)
             dims_ba[best_dim] = 1
-            planned_pushdowns.append((desc_index, dims_ba))
+            planned_downsplits.append((desc_index, dims_ba))
 
-        if planned_pushdowns:
+        if planned_downsplits:
             old_disc = discretization
-            discretization, pd_mapping = apply_planned_pushdowns(
+            discretization, pd_mapping = apply_planned_downsplits(
                 discretization,
-                planned_pushdowns,
+                planned_downsplits,
                 track_mapping="patches",
             )
 
             # Update coefficients: copy unchanged nodes, compute new parent + intermediates.
-            pushdown_dims: dict[int, int] = {
+            downdown_dims: dict[int, int] = {
                 old_i: next(d for d in range(num_dimensions) if dims_ba[d])
-                for old_i, dims_ba in planned_pushdowns
+                for old_i, dims_ba in planned_downsplits
             }
-            # Build old child index pairs for each pushed parent: {old_i: [(childA, childB), ...]}
+            # Build old child index pairs for each split parent: {old_i: [(childA, childB), ...]}
             old_child_pairs: dict[int, list[tuple[int, int]]] = {}
             linearization = old_disc._linearization
-            for old_i, pushed_dim in pushdown_dims.items():
+            for old_i, down_dim in downdown_dims.items():
                 old_ref = ba.bitarray(old_disc.descriptor[old_i])
                 remaining_ref = old_ref.copy()
-                remaining_ref[pushed_dim] = 0
+                remaining_ref[down_dim] = 0
                 n_rem = remaining_ref.count()
                 n_rem_slots = 1 << n_rem if n_rem > 0 else 1
                 old_children = old_disc.descriptor.get_children(old_i)
@@ -861,9 +861,9 @@ def compress_by_pushdown_coarsening(
                     child_bits = linearization.get_binary_position_from_index(
                         [child_pos], [old_ref]
                     )
-                    pushed_bit = int(child_bits[pushed_dim])
+                    down_bit = int(child_bits[down_dim])
                     rem_bits = child_bits.copy()
-                    rem_bits[pushed_dim] = 0
+                    rem_bits[down_dim] = 0
                     rem_pos = (
                         linearization.get_index_from_binary_position(
                             rem_bits, [], [remaining_ref]
@@ -872,7 +872,7 @@ def compress_by_pushdown_coarsening(
                         else 0
                     )
                     a, b = pairs[rem_pos]
-                    if pushed_bit == 0:
+                    if down_bit == 0:
                         pairs[rem_pos] = (child_idx, b)
                     else:
                         pairs[rem_pos] = (a, child_idx)
@@ -882,20 +882,20 @@ def compress_by_pushdown_coarsening(
                 [np.nan] for _ in range(len(discretization.descriptor))
             ]
             # Track new indices that receive computed merged-node coefficients,
-            # so we don't overwrite them when copying non-pushed old nodes.
+            # so we don't overwrite them when copying non-split old nodes.
             merged_new_indices: set[int] = set()
-            # First pass: handle pushed parents (compute new parent + child coefficients).
+            # First pass: handle split parents (compute new parent + child coefficients).
             for old_i, new_i_set in enumerate(pd_mapping):
-                if old_i not in pushdown_dims:
+                if old_i not in downdown_dims:
                     continue
 
-                pushed_dim = pushdown_dims[old_i]
+                down_dim = downdown_dims[old_i]
                 old_ref = ba.bitarray(old_disc.descriptor[old_i])
                 remaining_ref = old_ref.copy()
-                remaining_ref[pushed_dim] = 0
+                remaining_ref[down_dim] = 0
 
-                new_parent_coeffs, interm_coeffs = pushdown_single_node_coefficients(
-                    coefficients[old_i], old_ref, pushed_dim
+                new_parent_coeffs, interm_coeffs = downsplit_single_node_coefficients(
+                    coefficients[old_i], old_ref, down_dim
                 )
 
                 # The new parent is the unique node in new_i_set with ref == remaining_ref.
@@ -913,7 +913,7 @@ def compress_by_pushdown_coarsening(
                     child_ref = ba.bitarray(discretization.descriptor[child_start])
                     k_child = child_ref.count()
                     if k_child <= 1:
-                        # Regular (non-merged) intermediate or leaf: use pushdown result.
+                        # Regular (non-merged) intermediate or leaf: use downsplit result.
                         # Restore NaN convention for the scaling slot (index 0).
                         ic = list(interm_coeffs[r])
                         ic[0] = np.nan
@@ -921,25 +921,25 @@ def compress_by_pushdown_coarsening(
                         merged_new_indices.add(child_start)
                     else:
                         # Merged non-leaf: compute directly in wavelet space.
-                        # The two absorbed children are childA (pushed_dim=0) and
-                        # childB (pushed_dim=1) at remaining-dim position r.
+                        # The two absorbed children are childA (down_dim=0) and
+                        # childB (down_dim=1) at remaining-dim position r.
                         childA_idx, childB_idx = old_child_pairs[old_i][r]
                         merged_ref = child_ref
                         child_orig_ref = merged_ref.copy()
-                        child_orig_ref[pushed_dim] = 0
+                        child_orig_ref[down_dim] = 0
                         new_coefficients[child_start] = _merged_node_coefficients(
                             coefficients[childA_idx],
                             coefficients[childB_idx],
-                            interm_coeffs[r][1],  # pushed-dim detail
-                            pushed_dim,
+                            interm_coeffs[r][1],  # split-dim detail
+                            down_dim,
                             merged_ref,
                         )
                         merged_new_indices.add(child_start)
 
-            # Second pass: copy coefficients for non-pushed old nodes,
+            # Second pass: copy coefficients for non-split old nodes,
             # skipping new indices already assigned by merged-node computation.
             for old_i, new_i_set in enumerate(pd_mapping):
-                if old_i in pushdown_dims:
+                if old_i in downdown_dims:
                     continue
                 new_i = next(iter(new_i_set))
                 if new_i not in merged_new_indices:
@@ -950,7 +950,7 @@ def compress_by_pushdown_coarsening(
         # ── Coarsening round ────────────────────────────────────────────────
         p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
         planned_any = False
-        # Recompute levels after pushdown may have changed the descriptor.
+        # Recompute levels after downsplit may have changed the descriptor.
         node_levels = _compute_node_levels(discretization.descriptor)
 
         # Backwards iteration: children are visited before parents,
@@ -1035,10 +1035,10 @@ def compress_by_pushdown_coarsening(
             coefficients = new_coefficients
 
         # ── Normalization round ──────────────────────────────────────────
-        # After pushdown + coarsening the tree may contain uniqueness
+        # After downsplit + coarsening the tree may contain uniqueness
         # violations (1-D intermediates whose children all share a dimension
         # the parent doesn't have).  Fix them by applying the inverse of the
-        # pushdown formula purely in wavelet space, then restructure with
+        # downsplit formula purely in wavelet space, then restructure with
         # marker-based normalization.
         #
         # Nested violations (where inner violation parents are children of
@@ -1081,7 +1081,7 @@ def compress_by_pushdown_coarsening(
                 absorbed_dims = common_child_ref & ~parent_ref
                 merged_ref = parent_ref | absorbed_dims
 
-                merged_coeffs, split_children = unpushdown_coefficients(
+                merged_coeffs, split_children = reverse_downsplit_coefficients(
                     coefficients[parent_hi],
                     parent_ref,
                     [coefficients[ci] for ci in children_hi],
@@ -1233,15 +1233,15 @@ def compress_by_level_sweep_coarsening(
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
 ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
-    """Continue compression from a pushdown result by sweeping lower depths.
+    """Continue compression from a downsplit result by sweeping lower depths.
 
-    Expects the input to already be the result of compress_by_pushdown_coarsening
-    (i.e., canonical coarsening + default pushdown to convergence).
+    Expects the input to already be the result of compress_by_downsplit_coarsening
+    (i.e., canonical coarsening + default downsplit to convergence).
     Sweeps remaining multi-dimensional depths (max down to 0), then re-converges
-    with default pushdown.  Repeats until no further improvement.
+    with default downsplit.  Repeats until no further improvement.
 
-    This guarantees at least as many boxes are removed as default pushdown alone,
-    since the input already is the pushdown result and this only adds work.
+    This guarantees at least as many boxes are removed as default downsplit alone,
+    since the input already is the downsplit result and this only adds work.
     """
     # Sweep remaining multi-dim depths and re-converge
     while True:
@@ -1259,15 +1259,15 @@ def compress_by_level_sweep_coarsening(
             break
 
         old_count = len(discretization)
-        # Push at each remaining multi-dim depth (max down to lowest)
-        discretization, coefficients = compress_by_pushdown_coarsening(
+        # Downsplit at each remaining multi-dim depth (max down to lowest)
+        discretization, coefficients = compress_by_downsplit_coarsening(
             discretization,
             [list(c) for c in coefficients],
             coarsening_threshold,
             _depth_schedule=multi_dim_depths,
         )
-        # Re-converge with default pushdown to exploit any new opportunities
-        discretization, coefficients = compress_by_pushdown_coarsening(
+        # Re-converge with default downsplit to exploit any new opportunities
+        discretization, coefficients = compress_by_downsplit_coarsening(
             discretization,
             [list(c) for c in coefficients],
             coarsening_threshold,

@@ -16,7 +16,7 @@ from wavelets_with_omnitrees import (
     transform_to_all_wavelet_coefficients,
     get_leaf_scalings,
     compress_by_omnitree_coarsening,
-    compress_by_pushdown_coarsening,
+    compress_by_downsplit_coarsening,
     compress_by_level_sweep_coarsening,
 )
 from compare_openvdb_vs_wavelet_omnitrees import (
@@ -48,7 +48,7 @@ def _sphere_fn(points):
 
 
 def _full_pipeline(dim, level, inside_fn):
-    """Run the full pipeline: sample → hierarchize → canonical → pushdown → level_sweep."""
+    """Run the full pipeline: sample → hierarchize → canonical → downsplit → level_sweep."""
     disc = _build_full_grid(dim, level)
     # Sample at finest-level midpoints (the canonical way)
     grid_res = 1 << level
@@ -70,7 +70,7 @@ def _full_pipeline(dim, level, inside_fn):
         [list(c) for c in coefficients],
         coarsening_threshold=0.0,
     )
-    disc_pd, coeff_pd = compress_by_pushdown_coarsening(
+    disc_pd, coeff_pd = compress_by_downsplit_coarsening(
         disc_can,
         [list(c) for c in coeff_can],
         coarsening_threshold=0.0,
@@ -124,7 +124,7 @@ def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
         [list(c) for c in coefficients],
         coarsening_threshold=coarsening_threshold,
     )
-    disc_pd, coeff_pd = compress_by_pushdown_coarsening(
+    disc_pd, coeff_pd = compress_by_downsplit_coarsening(
         disc_can,
         [list(c) for c in coeff_can],
         coarsening_threshold=coarsening_threshold,
@@ -138,7 +138,7 @@ def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
 
 
 def test_2d_no_compression():
-    """Test compression on a 2D descriptor where no lossless compression is possible without cascading pushdown"""
+    """Test compression on a 2D descriptor where no lossless compression is possible without cascading downsplit"""
     disc = _build_disc_from_descriptor_string(2, "11 00 10 10 00 00 00 00 10 00 00")
     nodal = np.array([0, 0, 1, 1, 1, 0, 1], dtype=np.float64)
     assert len(disc) == 7
@@ -169,8 +169,8 @@ _________________
     assert dyada.discretization_to_2d_ascii(disc) == ascii_before_and_after
 
 
-def test_2d_pushdown_compresses():
-    """Test compression on a 2D descriptor where pushdown enables coarsening"""
+def test_2d_downsplit_compresses():
+    """Test compression on a 2D descriptor where downsplit enables coarsening"""
     disc = _build_disc_from_descriptor_string(2, "11 10 00 00 00 00 00")
     nodal = np.array([0, 1, 1, 0, 1], dtype=np.float64)
     assert len(disc) == 5
@@ -191,7 +191,7 @@ _________
 
     # Canonical coarsening does not change anything
     assert len(disc_can) == 5
-    # Pushdown merges the right column: 5 → 4 boxes
+    # Downsplit merges the right column: 5 → 4 boxes
     assert len(disc_pd) == 4
     assert len(disc_ls) == 4
     assert (
@@ -214,14 +214,14 @@ class TestReconstructFromFile:
     """Verify that loading a descriptor and reconstructing coefficients via
     _sample_at_finest_midpoints gives the same result as the full pipeline."""
 
-    def test_level_sweep_from_loaded_pushdown_2d(self):
+    def test_level_sweep_from_loaded_downsplit_2d(self):
         dim, level = 2, 3
         disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _full_pipeline(
             dim, level, _sphere_fn
         )
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Save pushdown descriptor
+            # Save downsplit descriptor
             disc_pd.descriptor.to_file(str(Path(tmp) / "pd"))
             pd_file = Path(tmp) / f"pd_{dim}d.bin"
             assert pd_file.exists()
@@ -246,7 +246,7 @@ class TestReconstructFromFile:
             get_leaf_scalings(disc_ls, coeff_ls),
         )
 
-    def test_level_sweep_from_loaded_pushdown_3d(self):
+    def test_level_sweep_from_loaded_downsplit_3d(self):
         dim, level = 3, 3
         disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _full_pipeline(
             dim, level, _sphere_fn
@@ -272,7 +272,7 @@ class TestReconstructFromFile:
             get_leaf_scalings(disc_ls, coeff_ls),
         )
 
-    def test_pushdown_from_loaded_canonical_2d(self):
+    def test_downsplit_from_loaded_canonical_2d(self):
         dim, level = 2, 3
         disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _full_pipeline(
             dim, level, _sphere_fn
@@ -286,7 +286,7 @@ class TestReconstructFromFile:
             leaf_values = _sample_at_finest_midpoints(loaded_disc, _sphere_fn, level)
             loaded_coeff = _hierarchize_on_tree(loaded_disc, leaf_values)
 
-            disc_pd2, coeff_pd2 = compress_by_pushdown_coarsening(
+            disc_pd2, coeff_pd2 = compress_by_downsplit_coarsening(
                 loaded_disc,
                 [list(c) for c in loaded_coeff],
                 coarsening_threshold=0.0,
