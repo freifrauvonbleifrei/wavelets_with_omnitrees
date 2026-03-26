@@ -163,16 +163,41 @@ def openvdb_coefficients(vdb_file):
         return None
 
     try:
-        grid = vdb.read(str(vdb_file))
+        grid = vdb.read(str(vdb_file), "inside")
     except Exception as e:
         print(f"  openvdb read failed: {e}")
         return None
 
     active_leaf = grid.activeLeafVoxelCount()
-    inactive_leaf = grid.inactiveLeafVoxelCount()
     active_tiles = grid.activeTileCount()
-    total_leaf_coefficients = active_leaf + inactive_leaf
-    total_coefficients = total_leaf_coefficients + active_tiles
+
+    # inactiveLeafVoxelCount and leafCount not always available in Python bindings
+    inactive_leaf = (
+        grid.inactiveLeafVoxelCount()
+        if hasattr(grid, "inactiveLeafVoxelCount")
+        else None
+    )
+    leaf_count = (
+        grid.leafCount()
+        if hasattr(grid, "leafCount")
+        else None
+    )
+
+    if inactive_leaf is not None:
+        total_leaf_coefficients = active_leaf + inactive_leaf
+    elif leaf_count is not None:
+        # Each leaf node has 8^3 = 512 voxels
+        total_leaf_coefficients = leaf_count * 512
+        inactive_leaf = total_leaf_coefficients - active_leaf
+    else:
+        total_leaf_coefficients = None
+        inactive_leaf = None
+
+    total_coefficients = (
+        total_leaf_coefficients + active_tiles
+        if total_leaf_coefficients is not None
+        else None
+    )
 
     return {
         "active_leaf": active_leaf,
