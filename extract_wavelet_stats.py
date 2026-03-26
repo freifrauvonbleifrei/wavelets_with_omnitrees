@@ -27,12 +27,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from dyada import Discretization, MortonOrderLinearization, RefinementDescriptor
 
-try:
-    import openvdb as vdb
-
-    _HAS_OPENVDB = True
-except ImportError:
-    _HAS_OPENVDB = False
 
 DIMENSIONALITY = 3
 
@@ -152,60 +146,17 @@ def openvdb_topology_bits(vdb_file):
             stats["total_topology_bytes"] = obj["total_topology_bytes"]
         elif "value_summary" in obj:
             stats["active_leaf_voxels"] = obj["active_leaf_voxels"]
+            stats["inactive_leaf_voxels"] = obj.get("inactive_leaf_voxels")
+            stats["active_tiles"] = obj.get("active_tiles")
+            stats["leaf_count"] = obj.get("leaf_count")
+            stats["total_leaf_coefficients"] = obj.get("total_leaf_coefficients")
+            stats["total_coefficients"] = obj.get("total_coefficients")
             stats["dense_value_bits"] = obj["dense_value_bits"]
             stats["active_value_bits"] = obj["active_value_bits"]
     return stats if stats else None
 
 
-def openvdb_coefficients(vdb_file):
-    """Read coefficient counts from a VDB file via the openvdb Python API."""
-    if not _HAS_OPENVDB:
-        return None
 
-    try:
-        grid = vdb.read(str(vdb_file), "inside")
-    except Exception as e:
-        print(f"  openvdb read failed: {e}")
-        return None
-
-    active_leaf = grid.activeLeafVoxelCount()
-    active_tiles = grid.activeTileCount()
-
-    # inactiveLeafVoxelCount and leafCount not always available in Python bindings
-    inactive_leaf = (
-        grid.inactiveLeafVoxelCount()
-        if hasattr(grid, "inactiveLeafVoxelCount")
-        else None
-    )
-    leaf_count = (
-        grid.leafCount()
-        if hasattr(grid, "leafCount")
-        else None
-    )
-
-    if inactive_leaf is not None:
-        total_leaf_coefficients = active_leaf + inactive_leaf
-    elif leaf_count is not None:
-        # Each leaf node has 8^3 = 512 voxels
-        total_leaf_coefficients = leaf_count * 512
-        inactive_leaf = total_leaf_coefficients - active_leaf
-    else:
-        total_leaf_coefficients = None
-        inactive_leaf = None
-
-    total_coefficients = (
-        total_leaf_coefficients + active_tiles
-        if total_leaf_coefficients is not None
-        else None
-    )
-
-    return {
-        "active_leaf": active_leaf,
-        "inactive_leaf": inactive_leaf,
-        "active_tiles": active_tiles,
-        "total_leaf_coefficients": total_leaf_coefficients,
-        "total_coefficients": total_coefficients,
-    }
 
 
 def discover_files(directory):
@@ -261,7 +212,7 @@ def process_one(thingi_id, level, files):
         row["ds_topo_bits"] = s["topo_bits"]
         row["ds_ref_counts"] = s["ref_counts"]
     
-    # OpenVDB
+    # OpenVDB (all stats from the C++ vdb_topology_bits tool)
     if "openvdb" in files:
         vdb_stats = openvdb_topology_bits(files["openvdb"])
         if vdb_stats:
@@ -270,14 +221,11 @@ def process_one(thingi_id, level, files):
             row["vdb_active_leaf_voxels"] = vdb_stats.get("active_leaf_voxels")
             row["vdb_dense_value_bits"] = vdb_stats.get("dense_value_bits")
             row["vdb_active_value_bits"] = vdb_stats.get("active_value_bits")
-
-        coeff_stats = openvdb_coefficients(files["openvdb"])
-        if coeff_stats:
-            row["vdb_active_leaf"] = coeff_stats["active_leaf"]
-            row["vdb_inactive_leaf"] = coeff_stats["inactive_leaf"]
-            row["vdb_active_tiles"] = coeff_stats["active_tiles"]
-            row["vdb_total_leaf_coefficients"] = coeff_stats["total_leaf_coefficients"]
-            row["vdb_total_coefficients"] = coeff_stats["total_coefficients"]
+            row["vdb_active_leaf"] = vdb_stats.get("active_leaf_voxels")
+            row["vdb_inactive_leaf"] = vdb_stats.get("inactive_leaf_voxels")
+            row["vdb_active_tiles"] = vdb_stats.get("active_tiles")
+            row["vdb_total_leaf_coefficients"] = vdb_stats.get("total_leaf_coefficients")
+            row["vdb_total_coefficients"] = vdb_stats.get("total_coefficients")
 
     return row
 

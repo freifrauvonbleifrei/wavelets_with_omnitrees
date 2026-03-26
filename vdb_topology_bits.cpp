@@ -128,6 +128,11 @@ void processGrid(const std::string &name, typename GridType::Ptr grid) {
   //                       (regions uniform enough to not be subdivided).
   const openvdb::Index64 activeLeafVoxels = grid->tree().activeLeafVoxelCount();
   const openvdb::Index64 activeTiles = grid->tree().activeTileCount();
+  const openvdb::Index64 leafCount = (counts.size() > 0) ? counts[0] : 0;
+  const openvdb::Index64 totalLeafVoxels =
+      leafCount * static_cast<openvdb::Index64>(LeafT::NUM_VOXELS);
+  const openvdb::Index64 inactiveLeafVoxels = totalLeafVoxels - activeLeafVoxels;
+  const openvdb::Index64 totalCoefficients = totalLeafVoxels + activeTiles;
 
   const openvdb::Index64 activeValueBits =
       (activeLeafVoxels + activeTiles) * bitsPerValue;
@@ -135,8 +140,12 @@ void processGrid(const std::string &name, typename GridType::Ptr grid) {
   std::cout << "{" << "\"grid\":\"" << name << "\","
             << "\"value_summary\":true,"
             << "\"bits_per_value\":" << bitsPerValue << ","
+            << "\"leaf_count\":" << leafCount << ","
             << "\"active_leaf_voxels\":" << activeLeafVoxels << ","
+            << "\"inactive_leaf_voxels\":" << inactiveLeafVoxels << ","
             << "\"active_tiles\":" << activeTiles << ","
+            << "\"total_leaf_coefficients\":" << totalLeafVoxels << ","
+            << "\"total_coefficients\":" << totalCoefficients << ","
             << "\"dense_value_bits\":" << denseValueBits << ","
             << "\"dense_value_bytes\":" << (denseValueBits / 8) << ","
             << "\"active_value_bits\":" << activeValueBits << ","
