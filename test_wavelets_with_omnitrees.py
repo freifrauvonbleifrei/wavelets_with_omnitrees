@@ -137,16 +137,24 @@ def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
     return disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls
 
 
-def test_2d_no_compression():
-    """Test compression on a 2D descriptor where no lossless compression is possible without cascading downsplit"""
+def test_2d_cascading_downsplit():
+    """Test that cascading downsplit compresses a tree that single-level downsplit cannot.
+
+    The grid has matching sub-patterns across y at certain x positions,
+    which cascading downsplit detects by splitting dim 1 first (merge-preferring
+    heuristic), then further splitting the merged multi-dim child, enabling
+    coarsening where the y-detail is zero.
+    """
     disc = _build_disc_from_descriptor_string(2, "11 00 10 10 00 00 00 00 10 00 00")
     nodal = np.array([0, 0, 1, 1, 1, 0, 1], dtype=np.float64)
     assert len(disc) == 7
-    ascii_before_and_after = """\
+    assert (
+        dyada.discretization_to_2d_ascii(disc)
+        == """\
 _________________
 |_______|___|___|
 |_______|_|_|___|"""
-    assert dyada.discretization_to_2d_ascii(disc) == ascii_before_and_after
+    )
 
     labels = [str(int(v)) for v in nodal]
     _plot_tikz(disc, labels, "before")
@@ -155,18 +163,27 @@ _________________
         disc, nodal
     )
 
-    # With threshold=0, no wavelet coefficient is exactly zero,
-    # so the tree should be unchanged through all stages
+    # Canonical coarsening: no change (no zero details at threshold=0)
     assert len(disc_can) == 7
-    assert len(disc_pd) == 7
-    assert len(disc_ls) == 7
-    assert disc_ls.descriptor._data == disc.descriptor._data
+    # Cascading downsplit: merges the top-right cell (both y-values are 1) → 7→6
+    assert len(disc_pd) == 6
+    assert len(disc_ls) == 6
+    assert (
+        dyada.discretization_to_2d_ascii(disc_pd)
+        == """\
+_________________
+|_______|___|   |
+|_______|_|_|___|"""
+    )
 
+    # Lossless: reconstructed scalings match original at the raster level
     scalings = get_leaf_scalings(disc_ls, coeff_ls)
-    np.testing.assert_array_equal(scalings, nodal)
+    from wavelets_with_omnitrees import get_resampled_image
 
-    _plot_tikz(disc_ls, labels, "after")
-    assert dyada.discretization_to_2d_ascii(disc) == ascii_before_and_after
+    target_level = disc.descriptor.get_maximum_level().astype(np.int64)
+    raster_orig = get_resampled_image(disc, nodal, target_level)
+    raster_new = get_resampled_image(disc_ls, scalings, target_level)
+    np.testing.assert_array_equal(raster_orig, raster_new)
 
 
 def test_2d_downsplit_compresses():
@@ -206,8 +223,43 @@ _________
     scalings = get_leaf_scalings(disc_ls, coeff_ls)
     np.testing.assert_array_equal(scalings, np.array([0, 1, 0, 1]))
 
-    labels_after = [str(int(v)) for v in scalings]
-    _plot_tikz(disc_ls, labels_after, "after_pd")
+
+def test_3d_level_sweep_compresses_beyond_downsplit():
+    """Test that level sweep compresses further than downsplit in 3D.
+
+    In 3D, downsplitting a 3-way refined node leaves 2-way refined children.
+    The default downsplit (which targets only the deepest multi-dim nodes) may
+    stop before processing those shallower 2-way nodes.  Level sweep explicitly
+    schedules all remaining multi-dim depths and achieves further compression.
+    """
+    disc = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(),
+        dyada.descriptor.RefinementDescriptor(3, [1, 1, 2]),
+    )
+    nodal = np.array([0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=np.float64)
+    assert len(disc) == 16
+
+    disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
+        disc, nodal
+    )
+
+    # Canonical coarsening reduces from 16 to 13
+    assert len(disc_can) == 13
+
+    # Downsplit reduces to 12 but leaves multi-dim nodes at shallower depths
+    assert len(disc_pd) == 12
+
+    # Level sweep processes those shallower multi-dim nodes: 12 → 8
+    assert len(disc_ls) == 8
+    scalings_ls = get_leaf_scalings(disc_ls, coeff_ls)
+
+    # Verify lossless reconstruction
+    from wavelets_with_omnitrees import get_resampled_image
+
+    target_level = disc.descriptor.get_maximum_level().astype(np.int64)
+    raster_orig = get_resampled_image(disc, nodal, target_level)
+    raster_new = get_resampled_image(disc_ls, scalings_ls, target_level)
+    np.testing.assert_array_equal(raster_orig, raster_new)
 
 
 class TestReconstructFromFile:
