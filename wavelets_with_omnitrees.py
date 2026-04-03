@@ -67,9 +67,9 @@ def hierarchize(
     )
     # scope for asserting perfect reconstructability
     if True:
-        assert all(
-            nodal_coefficients
-            == np.matmul(nodalization_matrix(num_refined_dimensions), result)
+        assert np.allclose(
+            nodal_coefficients,
+            np.matmul(nodalization_matrix(num_refined_dimensions), result),
         )
     return result
 
