@@ -205,7 +205,10 @@ def process_one(thingi_id, level, files):
 
     # Downsplit (pushdown)
     if "pushdown" in files or "downsplit" in files:
-        disc = load_descriptor(files["pushdown"])
+        try:
+            disc = load_descriptor(files["pushdown"])
+        except KeyError:
+            disc = load_descriptor(files["downsplit"])
         s = descriptor_stats(disc)
         row["ds_nodes"] = s["nodes"]
         row["ds_boxes"] = s["boxes"]
