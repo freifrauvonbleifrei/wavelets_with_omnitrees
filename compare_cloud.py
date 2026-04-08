@@ -29,16 +29,26 @@ import dyada.discretization
 import dyada.linearization
 
 try:
+    from wavelets_with_omnitrees.dyada_cache_patch import install as _install_cache
+except ModuleNotFoundError:
+    from dyada_cache_patch import install as _install_cache  # type: ignore
+_install_cache()
+
+try:
     from wavelets_with_omnitrees.wavelets_with_omnitrees import (
         transform_to_all_wavelet_coefficients,
         get_leaf_scalings,
         _compute_node_levels,
+        compress_by_omnitree_coarsening,
+        compress_by_downsplit_coarsening,
     )
 except ModuleNotFoundError:
     from wavelets_with_omnitrees import (  # type: ignore
         transform_to_all_wavelet_coefficients,
         get_leaf_scalings,
         _compute_node_levels,
+        compress_by_omnitree_coarsening,
+        compress_by_downsplit_coarsening,
     )
 
 
@@ -71,65 +81,28 @@ def levels_from_extent(extent: np.ndarray) -> np.ndarray:
     return np.array([int(math.ceil(math.log2(max(e, 1)))) for e in extent])
 
 
-def vdb_to_dense_array(grid, bbox_min: np.ndarray, dims: int) -> np.ndarray:
-    """Copy VDB grid data into a dense numpy array."""
-    background = float(grid.background)
-    array = np.full((dims, dims, dims), background, dtype=np.float64)
-
-    try:
-        buf = np.full((dims, dims, dims), background, dtype=np.float32)
-        grid.copyToArray(buf, ijk=tuple(int(c) for c in bbox_min))
-        array[:] = buf
-        return array
-    except (AttributeError, TypeError):
-        pass
-
-    print("  (copyToArray not available, using accessor fallback — may be slow)")
-    _, active_max_incl = grid.evalActiveVoxelBoundingBox()
-    active_max = np.array(active_max_incl, dtype=np.int64) + 1
-    active_min = np.array(grid.evalActiveVoxelBoundingBox()[0], dtype=np.int64)
-
-    rel_min = np.maximum(active_min - bbox_min, 0).astype(int)
-    rel_max = np.minimum(active_max - bbox_min, dims).astype(int)
-
-    acc = grid.getAccessor()
-    for x in range(rel_min[0], rel_max[0]):
-        for y in range(rel_min[1], rel_max[1]):
-            for z in range(rel_min[2], rel_max[2]):
-                ijk = (
-                    int(bbox_min[0]) + x,
-                    int(bbox_min[1]) + y,
-                    int(bbox_min[2]) + z,
-                )
-                val, active = acc.probeValue(ijk)
-                if active:
-                    array[x, y, z] = float(val)
-    return array
-
-
-# ── Adaptive octree from VDB (sparse — no full dense array) ───────────────
-
 _LEAF_3D = ba.frozenbitarray("000")
 _FULL_SPLIT_3D = ba.frozenbitarray("111")
 
-# Maximum sub-region size for which we copy data to check uniformity.
-# 128^3 × 4 bytes = 8 MB per buffer — small enough for on-stack use.
-_MAX_CHECK_SIZE = 128
+_MAX_CHECK_VOL = 128 ** 3
 
 
 def omnitree_from_vdb(
     grid,
     bbox_min: np.ndarray,
-    level: int,
+    per_dim_levels: np.ndarray,
 ) -> tuple[dyada.discretization.Discretization, np.ndarray]:
-    """Build an adaptive omnitree from a VDB grid.
+    """Build an adaptive omnitree from a VDB grid with per-dimension levels.
 
     Queries VDB directly without allocating the full dense array.
     Regions outside the active bounding box are immediately collapsed to
     background-valued leaves.  Small sub-regions are checked for uniformity
     via copyToArray into a temporary buffer.
+
+    When per-dimension levels differ, the tree uses partial refinements
+    (e.g. "101" instead of "111") once a dimension reaches its finest level.
     """
-    dims = 1 << level
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
     background = float(grid.background)
 
     # Active bounding box in *local* coordinates (relative to bbox_min)
@@ -137,7 +110,8 @@ def omnitree_from_vdb(
     ab_min = np.array(ab_min_global, dtype=np.int64) - bbox_min
     ab_max = np.array(ab_max_global, dtype=np.int64) + 1 - bbox_min  # exclusive
 
-    print(f"  Grid: {dims}^3, active local range: {ab_min} .. {ab_max}")
+    shape_str = " × ".join(str(s) for s in grid_shape)
+    print(f"  Grid: {shape_str}, active local range: {ab_min} .. {ab_max}")
 
     # Global offset for copyToArray ijk parameter
     gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
@@ -145,43 +119,61 @@ def omnitree_from_vdb(
     descriptor_bits = ba.bitarray()
     leaf_values: list[float] = []
 
-    def _recurse(x0: int, y0: int, z0: int, size: int) -> None:
+    _LEAF = ba.frozenbitarray("000")
+
+    def _recurse(x0: int, y0: int, z0: int,
+                 sx: int, sy: int, sz: int) -> None:
         # Fast path: entirely outside active bounding box → background leaf
-        if (x0 >= ab_max[0] or x0 + size <= ab_min[0] or
-            y0 >= ab_max[1] or y0 + size <= ab_min[1] or
-            z0 >= ab_max[2] or z0 + size <= ab_min[2]):
-            descriptor_bits.extend(_LEAF_3D)
+        if (x0 >= ab_max[0] or x0 + sx <= ab_min[0] or
+            y0 >= ab_max[1] or y0 + sy <= ab_min[1] or
+            z0 >= ab_max[2] or z0 + sz <= ab_min[2]):
+            descriptor_bits.extend(_LEAF)
             leaf_values.append(background)
             return
 
-        if size == 1:
-            descriptor_bits.extend(_LEAF_3D)
-            # Single voxel — probe directly
+        if sx == 1 and sy == 1 and sz == 1:
+            descriptor_bits.extend(_LEAF)
             acc = grid.getConstAccessor()
             val = acc.getValue((gx + x0, gy + y0, gz + z0))
             leaf_values.append(float(val))
             return
 
         # For small-enough regions, copy and check uniformity
-        if size <= _MAX_CHECK_SIZE:
-            buf = np.full((size, size, size), background, dtype=np.float32)
+        if sx * sy * sz <= _MAX_CHECK_VOL:
+            buf = np.full((sx, sy, sz), background, dtype=np.float32)
             grid.copyToArray(buf, ijk=(gx + x0, gy + y0, gz + z0))
             if buf.min() == buf.max():
-                descriptor_bits.extend(_LEAF_3D)
+                descriptor_bits.extend(_LEAF)
                 leaf_values.append(float(buf.flat[0]))
                 return
 
-        # Non-uniform (or too large to check cheaply): split
-        descriptor_bits.extend(_FULL_SPLIT_3D)
-        half = size >> 1
-        for child_idx in range(8):
-            cx = x0 + half * (child_idx & 1)
-            cy = y0 + half * ((child_idx >> 1) & 1)
-            cz = z0 + half * ((child_idx >> 2) & 1)
-            _recurse(cx, cy, cz, half)
+        # Determine which dimensions to split (those with size > 1)
+        can_split = [sx > 1, sy > 1, sz > 1]
+        ref = ba.bitarray(can_split)
+        descriptor_bits.extend(ref)
 
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), level + 100))
-    _recurse(0, 0, 0, dims)
+        child_sx = sx // 2 if can_split[0] else sx
+        child_sy = sy // 2 if can_split[1] else sy
+        child_sz = sz // 2 if can_split[2] else sz
+
+        refined_dims = [d for d in range(3) if can_split[d]]
+        num_children = 1 << len(refined_dims)
+
+        for child_idx in range(num_children):
+            cx, cy, cz = x0, y0, z0
+            for bit, d in enumerate(refined_dims):
+                if (child_idx >> bit) & 1:
+                    if d == 0:
+                        cx += child_sx
+                    elif d == 1:
+                        cy += child_sy
+                    else:
+                        cz += child_sz
+            _recurse(cx, cy, cz, child_sx, child_sy, child_sz)
+
+    max_level = int(max(per_dim_levels))
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), max_level + 100))
+    _recurse(0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])
 
     descriptor = dyada.descriptor.RefinementDescriptor.from_binary(
         3, descriptor_bits
@@ -417,7 +409,7 @@ def compute_max_error_at_threshold(
     discretization: dyada.discretization.Discretization,
     coefficients: list,
     coarsenable: set[int],
-    level: int,
+    per_dim_levels: np.ndarray,
     subtree_end: np.ndarray | None = None,
 ) -> float:
     """Compute max error for a wavelet-thresholded reconstruction.
@@ -425,7 +417,7 @@ def compute_max_error_at_threshold(
     Uses an iterative stack-based tree walk.  Reads VDB data on demand via
     copyToArray for each leaf/coarsened region — no full dense array needed.
     """
-    dims = 1 << level
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
     descriptor = discretization.descriptor
     background = float(grid.background)
     gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
@@ -435,7 +427,7 @@ def compute_max_error_at_threshold(
 
     max_err = 0.0
     # Stack entries: (desc_i, origin_x, origin_y, origin_z, size_x, size_y, size_z)
-    stack = [(0, 0, 0, 0, dims, dims, dims)]
+    stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
 
     while stack:
         desc_i, ox, oy, oz, sx, sy, sz = stack.pop()
@@ -540,7 +532,163 @@ def find_coarsenable_nodes(
     return coarsenable
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
+def omnitree_to_vdb(
+    discretization: dyada.discretization.Discretization,
+    leaf_values: np.ndarray,
+    per_dim_levels: np.ndarray,
+    bbox_min: np.ndarray,
+    grid_name: str = "density",
+    background: float = 0.0,
+    source_grid=None,
+) -> "vdb.FloatGrid":
+    """Convert an omnitree discretization + leaf values into an OpenVDB FloatGrid.
+
+    Each omnitree leaf becomes a VDB tile (uniform-value region) via grid.fill().
+    VDB internally stores uniform regions as tiles, so the resulting grid is
+    compact — proportional to the number of omnitree leaves, not the dense grid.
+
+    If *source_grid* is given, its transform is copied so the output VDB has
+    the same world-space coordinate system as the original.
+    """
+    grid = vdb.FloatGrid(background)
+    grid.name = grid_name
+    if source_grid is not None:
+        grid.transform = source_grid.transform
+
+    descriptor = discretization.descriptor
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
+    gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
+
+    subtree_end = _build_subtree_end(descriptor)
+
+    # Stack-based DFS: (desc_i, origin_x, origin_y, origin_z, size_x, size_y, size_z)
+    stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
+    leaf_idx = 0
+
+    while stack:
+        desc_i, ox, oy, oz, sx, sy, sz = stack.pop()
+        ref = descriptor[desc_i]
+
+        if ref.count() == 0:
+            val = float(leaf_values[leaf_idx])
+            leaf_idx += 1
+            if val != background:
+                # fill() uses inclusive min/max in VDB index space
+                grid.fill(
+                    (gx + ox, gy + oy, gz + oz),
+                    (gx + ox + sx - 1, gy + oy + sy - 1, gz + oz + sz - 1),
+                    val,
+                )
+            continue
+
+        # Inner node: push children in reverse order
+        csx, csy, csz = sx, sy, sz
+        if ref[0]:
+            csx //= 2
+        if ref[1]:
+            csy //= 2
+        if ref[2]:
+            csz //= 2
+
+        num_children = 1 << ref.count()
+        child_desc = desc_i + 1
+        child_entries = []
+        for child_idx in range(num_children):
+            cox, coy, coz = ox, oy, oz
+            local_bit = 0
+            for d in range(3):
+                if ref[d]:
+                    if (child_idx >> local_bit) & 1:
+                        if d == 0:
+                            cox += csx
+                        elif d == 1:
+                            coy += csy
+                        else:
+                            coz += csz
+                    local_bit += 1
+            child_entries.append((child_desc, cox, coy, coz, csx, csy, csz))
+            child_desc = int(subtree_end[child_desc])
+
+        for entry in reversed(child_entries):
+            stack.append(entry)
+
+    assert leaf_idx == len(leaf_values), (
+        f"leaf traversal mismatch: visited {leaf_idx}, expected {len(leaf_values)}"
+    )
+    return grid
+
+
+def _full_tree_nodes(per_dim_levels) -> int:
+    """Count nodes in a fully-refined tree with given per-dimension levels."""
+    max_depth = int(max(per_dim_levels))
+    total = 0
+    nodes_at_depth = 1
+    for d in range(max_depth + 1):
+        total += nodes_at_depth
+        if d < max_depth:
+            n_refined = sum(1 for l in per_dim_levels if int(l) > d)
+            nodes_at_depth *= 1 << n_refined
+    return total
+
+
+def _compute_leaf_max_error(grid, bbox_min, disc, coefficients, per_dim_levels):
+    """Compute max error between reconstructed leaf values and VDB ground truth."""
+    root_scaling = coefficients[0][0]
+    coeff_copy = [list(c) for c in coefficients]
+    for c in coeff_copy:
+        c[0] = np.nan
+    coeff_copy[0][0] = root_scaling
+    leaf_values = get_leaf_scalings(disc, coeff_copy)
+
+    subtree_end = _build_subtree_end(disc.descriptor)
+    coeff_for_err: list[list[float]] = [
+        [np.nan] for _ in range(len(disc.descriptor))
+    ]
+    leaf_idx = 0
+    for i in range(len(disc.descriptor)):
+        if disc.descriptor[i].count() == 0:
+            coeff_for_err[i] = [float(leaf_values[leaf_idx])]
+            leaf_idx += 1
+    return compute_max_error_at_threshold(
+        grid, bbox_min, disc, coeff_for_err, set(), per_dim_levels,
+        subtree_end=subtree_end,
+    )
+
+
+def _get_leaf_values(disc, coefficients):
+    """Extract leaf values from a discretization with wavelet coefficients."""
+    root_scaling = coefficients[0][0]
+    coeff_copy = [list(c) for c in coefficients]
+    for c in coeff_copy:
+        c[0] = np.nan
+    coeff_copy[0][0] = root_scaling
+    return get_leaf_scalings(disc, coeff_copy)
+
+
+def _save_stage(output_dir, basename, disc, coefficients, per_dim_levels,
+                bbox_min, grid, grid_name):
+    """Save descriptor + wavelet coefficients + back-transformed VDB + nonzero mask."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    disc.descriptor.to_file(str(out / basename))
+    values = _get_leaf_values(disc, coefficients)
+    bg = float(grid.background)
+    nonbg = values != bg
+    n_nonbg = int(np.count_nonzero(nonbg))
+    # Save only non-background values + a packed mask for reconstruction.
+    # To reconstruct:
+    #   mask = np.unpackbits(np.load("..._nonbg_mask.npy"))[:n_leaves].astype(bool)
+    #   values = np.full(n_leaves, bg)
+    #   values[mask] = np.load("..._values.npy")
+    np.save(str(out / f"{basename}_values.npy"), values[nonbg])
+    np.save(str(out / f"{basename}_nonbg_mask.npy"), np.packbits(nonbg))
+    out_grid = omnitree_to_vdb(
+        disc, values, per_dim_levels, bbox_min,
+        grid_name=grid_name, background=bg, source_grid=grid,
+    )
+    vdb.write(str(out / f"{basename}.vdb"), grids=[out_grid])
+    print(f"    -> saved {basename} (descriptor + coefficients + .vdb + mask, "
+          f"{n_nonbg}/{len(values)} non-background)")
 
 
 def main():
@@ -585,37 +733,39 @@ def main():
     if not Path(vdb_path).exists():
         parser.error(f"File not found: {vdb_path}")
 
-    # ── Read VDB and determine resolution ───────────────────────────────────
     grid = read_vdb_grid(vdb_path, args.grid)
     bbox_min, bbox_max, extent = vdb_grid_extent(grid)
-    per_dim_levels = levels_from_extent(extent)
-    native_level = int(per_dim_levels.max())
-    level = min(native_level, args.max_level) if args.max_level else native_level
-    dims = 1 << level
+    native_per_dim_levels = levels_from_extent(extent)
+    if args.max_level:
+        per_dim_levels = np.minimum(native_per_dim_levels, args.max_level)
+    else:
+        per_dim_levels = native_per_dim_levels
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
+    total_voxels = int(np.prod(grid_shape))
 
-    mem_gb = (dims**3 * 8) / (1 << 30)
+    mem_gb = (total_voxels * 8) / (1 << 30)
+    shape_str = " × ".join(str(s) for s in grid_shape)
     print(f"VDB file: {vdb_path}")
     print(f"Grid: {args.grid}")
     print(f"Active bounding box: {bbox_min} -> {bbox_max}")
-    print(f"Extent: {extent}  (per-dim levels: {per_dim_levels})")
-    print(f"Level: {level} (native: {native_level})")
-    print(f"Padded grid: {dims}^3 = {dims**3:,} voxels ({mem_gb:.1f} GB dense)")
+    print(f"Extent: {extent}")
+    print(f"Per-dim levels: {per_dim_levels} (native: {native_per_dim_levels})")
+    print(f"Padded grid: {shape_str} = {total_voxels:,} voxels ({mem_gb:.1f} GB dense)")
     print(f"Active voxels: {grid.activeVoxelCount():,}")
     print(f"Background: {grid.background}")
     print()
 
-    # (No dense array needed — VDB is queried directly during tree construction)
+    # (No dense array needed VDB is queried directly during tree construction)
 
-    # ── Build adaptive omnitree from VDB ────────────────────────────────────
     print("Building adaptive omnitree from VDB...")
     sys.stdout.flush()
-    adaptive_disc, leaf_values = omnitree_from_vdb(grid, bbox_min, level)
+    adaptive_disc, leaf_values = omnitree_from_vdb(grid, bbox_min, per_dim_levels)
     adaptive_stats = descriptor_stats(adaptive_disc.descriptor)
-    full_grid_nodes = sum(8**i for i in range(level + 1))
+    full_grid_nodes = _full_tree_nodes(per_dim_levels)
     print(
         f"  Adaptive tree: {adaptive_stats['nodes']:,} nodes, "
         f"{adaptive_stats['boxes']:,} boxes "
-        f"(vs {full_grid_nodes:,} nodes for full octree)"
+        f"(vs {full_grid_nodes:,} nodes for full tree)"
     )
     print(
         f"  Compression from adaptive construction: "
@@ -631,12 +781,16 @@ def main():
     )
     root_scaling = coefficients[0][0]
     print(f"  Root scaling coefficient: {root_scaling:.6f}")
+
+    levels_str = "x".join(str(int(l)) for l in per_dim_levels)
+    if args.output_dir:
+        _save_stage(args.output_dir, f"cloud_l{levels_str}_octree",
+                    adaptive_disc, coefficients, per_dim_levels, bbox_min,
+                    grid, args.grid)
     print()
 
-    # ── Error computation flag ───────────────────────────────────────────────
     compute_error = not args.skip_error
 
-    # ── VDB topology stats ──────────────────────────────────────────────────
     print("OpenVDB topology:")
     vdb_stats = vdb_topology_stats(vdb_path, args.grid)
     vdb_py_stats = vdb_topology_stats_python(grid)
@@ -654,69 +808,81 @@ def main():
         print(f"  node log2 dims: {vdb_py_stats['node_log2_dims']}")
     print()
 
-    # ── Precompute subtree end table for fast tree traversal ──────────────
-    subtree_end = _build_subtree_end(adaptive_disc.descriptor) if compute_error else None
-
-    # ── Analyze wavelet compression at each threshold ──────────────��───────
-    print("Analyzing wavelet compression...")
-    sys.stdout.flush()
-    compression_stats = analyze_wavelet_compression(
-        adaptive_disc, coefficients, args.threshold
-    )
-
-    bits_per_coeff = 32  # float32
-
-    header = (
-        f"  {'method':<22s} {'nodes':>10s} {'boxes':>10s} {'topo bits':>12s} "
-        f"{'coeff bits':>12s} {'total bits':>12s} {'max err':>10s}"
-    )
-    sep = f"  {'-' * 82}"
-
     for threshold in args.threshold:
         label = "(lossless)" if threshold == 0.0 else ""
-        print(f"\n=== Threshold: {threshold} {label} ===")
+        print(f"=== Threshold: {threshold} {label} ===")
+
+        print("  Omnitree coarsening...", end="", flush=True)
+        sys.stdout.flush()
+        disc_can, coeff_can = compress_by_omnitree_coarsening(
+            adaptive_disc,
+            [list(c) for c in coefficients],
+            coarsening_threshold=threshold,
+        )
+        can_stats = descriptor_stats(disc_can.descriptor)
+        print(f" {can_stats['nodes']:,} nodes, {can_stats['boxes']:,} boxes")
+
+        if args.output_dir:
+            _save_stage(args.output_dir, f"cloud_l{levels_str}_t{threshold}_omnitree",
+                        disc_can, coeff_can, per_dim_levels, bbox_min, grid, args.grid)
+
+        print("  Downsplit coarsening...", end="", flush=True)
+        sys.stdout.flush()
+        disc_ds, coeff_ds = compress_by_downsplit_coarsening(
+            disc_can,
+            [list(c) for c in coeff_can],
+            coarsening_threshold=threshold,
+        )
+        ds_stats = descriptor_stats(disc_ds.descriptor)
+        print(f" {ds_stats['nodes']:,} nodes, {ds_stats['boxes']:,} boxes")
+
+        if args.output_dir:
+            _save_stage(args.output_dir, f"cloud_l{levels_str}_t{threshold}_downsplit",
+                        disc_ds, coeff_ds, per_dim_levels, bbox_min, grid, args.grid)
+
+        if threshold == 0.0:
+            oct_err = can_err = ds_err = 0.0
+        elif not compute_error:
+            oct_err = can_err = ds_err = float("nan")
+        else:
+            oct_err = 0.0  # adaptive tree is always exact
+            print("  Computing omnitree error...", end="", flush=True)
+            can_err = _compute_leaf_max_error(
+                grid, bbox_min, disc_can, coeff_can, per_dim_levels,
+            )
+            print(f" {can_err:.6f}")
+            print("  Computing downsplit error...", end="", flush=True)
+            ds_err = _compute_leaf_max_error(
+                grid, bbox_min, disc_ds, coeff_ds, per_dim_levels,
+            )
+            print(f" {ds_err:.6f}")
+
+        bits_per_coeff = 32  # float32
+
+        header = (
+            f"  {'method':<22s} {'nodes':>10s} {'boxes':>10s} {'coeffs':>10s} "
+            f"{'topo bits':>12s} {'coeff bits':>12s} {'total bits':>12s} {'max err':>10s}"
+        )
+        sep = f"  {'-' * 94}"
         print(header)
         print(sep)
 
-        stats = compression_stats[threshold]
-
-        # Compute max error
-        if threshold == 0.0:
-            max_err = 0.0
-        elif not compute_error:
-            max_err = float("nan")
-        else:
-            coarsenable = find_coarsenable_nodes(
-                adaptive_disc, coefficients, threshold
-            )
-            max_err = compute_max_error_at_threshold(
-                grid, bbox_min, adaptive_disc, coefficients, coarsenable, level,
-                subtree_end=subtree_end,
+        def _print_row(name, stats, err):
+            topo = stats["topo_bits"]
+            n_coeffs = stats["boxes"]
+            coeff_bits = n_coeffs * bits_per_coeff
+            total = topo + coeff_bits
+            err_str = f"{err:>10.6f}" if not math.isnan(err) else "       N/A"
+            print(
+                f"  {name:<22s} {stats['nodes']:>10,d} "
+                f"{stats['boxes']:>10,d} {n_coeffs:>10,d} "
+                f"{topo:>12,d} {coeff_bits:>12,d} "
+                f"{total:>12,d} {err_str}"
             )
 
-        omni_topo = stats["topo_bits"]
-        omni_coeffs = stats["boxes"] * bits_per_coeff
-        omni_total = omni_topo + omni_coeffs
-
-        err_str = f"{max_err:>10.6f}" if not math.isnan(max_err) else "       N/A"
-        print(
-            f"  {'omnitree+wavelet':<22s} {stats['nodes']:>10,d} "
-            f"{stats['boxes']:>10,d} "
-            f"{omni_topo:>12,d} {omni_coeffs:>12,d} "
-            f"{omni_total:>12,d} {err_str}"
-        )
-
-        # Adaptive octree reference (before wavelet coarsening)
-        adapt_topo = adaptive_stats["topo_bits"]
-        adapt_coeffs = adaptive_stats["boxes"] * bits_per_coeff
-        adapt_total = adapt_topo + adapt_coeffs
-        print(
-            f"  {'adaptive octree':<22s} "
-            f"{adaptive_stats['nodes']:>10,d} "
-            f"{adaptive_stats['boxes']:>10,d} "
-            f"{adapt_topo:>12,d} {adapt_coeffs:>12,d} "
-            f"{adapt_total:>12,d} {'0.000000':>10s}"
-        )
+        _print_row("octree", adaptive_stats, oct_err)
+        _print_row("omnitree", can_stats, can_err)
+        _print_row("downsplit", ds_stats, ds_err)
 
         # VDB reference
         if vdb_stats:
@@ -727,49 +893,42 @@ def main():
         else:
             vdb_topo = vdb_py_stats["total_topo_bits_approx"]
             vdb_active = vdb_py_stats["active_voxels"]
+            vdb_coeffs_count = vdb_active
             vdb_coeff_bits = vdb_active * bits_per_coeff
             vdb_total = vdb_topo + vdb_coeff_bits
 
         print(
-            f"  {'openvdb':<22s} {'--':>10s} {'--':>10s} "
+            f"  {'openvdb':<22s} {'--':>10s} {'--':>10s} {vdb_coeffs_count:>10,d} "
             f"{vdb_topo:>12,d} {vdb_coeff_bits:>12,d} "
             f"{vdb_total:>12,d} {'0.000000':>10s}"
         )
 
         # Full dense grid reference
-        full_voxels = dims**3
-        full_bits = full_voxels * bits_per_coeff
+        full_bits = total_voxels * bits_per_coeff
         print(
-            f"  {'full dense grid':<22s} {'--':>10s} {full_voxels:>10,d} "
+            f"  {'full dense grid':<22s} {'--':>10s} {total_voxels:>10,d} {total_voxels:>10,d} "
             f"{'0':>12s} {full_bits:>12,d} "
             f"{full_bits:>12,d} {'0.000000':>10s}"
         )
 
         print()
 
-        # ── Ratios ──────────────────────────────────────────────────────────
+        def _total_bits(stats):
+            return stats["topo_bits"] + stats["boxes"] * bits_per_coeff
+
+        oct_total = _total_bits(adaptive_stats)
+        can_total = _total_bits(can_stats)
+        ds_total = _total_bits(ds_stats)
+
         print(f"  Compression ratios (total bits vs full dense):")
-        print(f"    omnitree+wavelet: {omni_total / full_bits:.6f}x  ({full_bits / omni_total:.1f}:1)")
-        print(f"    adaptive octree:  {adapt_total / full_bits:.6f}x  ({full_bits / adapt_total:.1f}:1)")
-        print(f"    openvdb:          {vdb_total / full_bits:.6f}x  ({full_bits / vdb_total:.1f}:1)")
+        for name, total in [("octree", oct_total), ("omnitree", can_total),
+                            ("downsplit", ds_total), ("openvdb", vdb_total)]:
+            print(f"    {name + ':':<22s} {total / full_bits:.6f}x  ({full_bits / total:.1f}:1)")
 
-        if threshold > 0.0:
-            print(f"  Wavelet coarsening vs adaptive:")
-            print(f"    nodes: {stats['nodes'] / adaptive_stats['nodes']:.4f}")
-            print(f"    boxes: {stats['boxes'] / adaptive_stats['boxes']:.4f}")
-            print(f"    coarsened: {stats['coarsenable_nodes']:,} nodes")
-
-        print(f"  Omnitree vs OpenVDB:")
-        print(f"    topo bits:  {omni_topo / vdb_topo:.4f}x" if vdb_topo > 0 else "    topo bits:  N/A")
-        print(f"    total bits: {omni_total / vdb_total:.4f}x" if vdb_total > 0 else "    total bits: N/A")
+        print(f"  Downsplit vs OpenVDB:")
+        print(f"    topo bits:  {ds_stats['topo_bits'] / vdb_topo:.4f}x" if vdb_topo > 0 else "    topo bits:  N/A")
+        print(f"    total bits: {ds_total / vdb_total:.4f}x" if vdb_total > 0 else "    total bits: N/A")
         print()
-
-    # ── Save descriptors ────────────────────────────────────────────────────
-    if args.output_dir:
-        out = Path(args.output_dir)
-        out.mkdir(parents=True, exist_ok=True)
-        adaptive_disc.descriptor.to_file(str(out / f"cloud_l{level}_adaptive"))
-        print(f"Saved adaptive descriptor to {out}/")
 
 
 if __name__ == "__main__":
