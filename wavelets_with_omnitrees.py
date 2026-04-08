@@ -179,6 +179,54 @@ def get_leaf_scalings(
     )
 
 
+def _precompute_location_codes(
+    descriptor: dyada.descriptor.RefinementDescriptor,
+) -> list[list]:
+    """Precompute per-node location codes in a single forward DFS pass.
+
+    Returns loc_codes[i] = list of num_dimensions bitarrays, encoding the
+    left/right path from root to node i in each dimension.
+    Equivalent to branch_to_location_code(get_branch(i)[0], linearization)
+    for Morton order, but O(n) total.
+    """
+    nd = descriptor.get_num_dimensions()
+    n = len(descriptor)
+    loc_codes: list[list] = [None] * n  # type: ignore
+    # Stack: (parent_loc, parent_refined_dims, remaining_children, next_child_idx)
+    stack: list = []
+    current_loc = [ba.bitarray() for _ in range(nd)]
+
+    for i in range(n):
+        loc_codes[i] = [ba.bitarray(d) for d in current_loc]
+
+        ref = descriptor[i]
+        if ref.count() > 0:
+            refined_dims = [d for d in range(nd) if ref[d]]
+            stack.append([
+                [ba.bitarray(d) for d in current_loc],
+                refined_dims,
+                1 << ref.count(),
+                0,
+            ])
+            # First child: all position bits are 0
+            for d in refined_dims:
+                current_loc[d].append(0)
+        else:
+            while stack:
+                parent_loc, refined_dims, remaining, child_idx = stack[-1]
+                remaining -= 1
+                child_idx += 1
+                if remaining > 0:
+                    stack[-1] = [parent_loc, refined_dims, remaining, child_idx]
+                    current_loc = [ba.bitarray(d) for d in parent_loc]
+                    for local_bit, d in enumerate(refined_dims):
+                        current_loc[d].append((child_idx >> local_bit) & 1)
+                    break
+                stack.pop()
+
+    return loc_codes
+
+
 def _compute_node_levels(
     descriptor: dyada.descriptor.RefinementDescriptor,
 ) -> list[npt.NDArray[np.int8]]:
@@ -847,15 +895,37 @@ def compress_by_downsplit_coarsening(
                 for old_i, dims_ba in planned_downsplits
             }
             # Build old child index pairs for each split parent: {old_i: [(childA, childB), ...]}
+            # Precompute subtree_end for O(1) child index lookups (avoids O(n) get_children)
+            old_desc = old_disc.descriptor
+            _n_old = len(old_desc)
+            _subtree_end = np.empty(_n_old, dtype=np.int64)
+            _ii = _n_old - 1
+            while _ii >= 0:
+                _ref = old_desc[_ii]
+                if _ref.count() == 0:
+                    _subtree_end[_ii] = _ii + 1
+                else:
+                    _cs = _ii + 1
+                    for _ in range(1 << _ref.count()):
+                        _cs = int(_subtree_end[_cs])
+                    _subtree_end[_ii] = _cs
+                _ii -= 1
+
             old_child_pairs: dict[int, list[tuple[int, int]]] = {}
             linearization = old_disc._linearization
             for old_i, down_dim in downdown_dims.items():
-                old_ref = ba.bitarray(old_disc.descriptor[old_i])
+                old_ref = ba.bitarray(old_desc[old_i])
                 remaining_ref = old_ref.copy()
                 remaining_ref[down_dim] = 0
                 n_rem = remaining_ref.count()
                 n_rem_slots = 1 << n_rem if n_rem > 0 else 1
-                old_children = old_disc.descriptor.get_children(old_i)
+                # Compute children via subtree_end instead of get_children
+                num_ch = 1 << old_ref.count()
+                old_children = []
+                _ci = old_i + 1
+                for _ in range(num_ch):
+                    old_children.append(_ci)
+                    _ci = int(_subtree_end[_ci])
                 pairs: list[tuple[int, int]] = [(-1, -1)] * n_rem_slots
                 for child_pos, child_idx in enumerate(old_children):
                     child_bits = linearization.get_binary_position_from_index(
@@ -1122,6 +1192,10 @@ def compress_by_downsplit_coarsening(
             )
             linearization = discretization._linearization
 
+            # Precompute location codes for both old and new descriptors (O(n) each)
+            old_loc_codes = _precompute_location_codes(old_disc.descriptor)
+            new_loc_codes = _precompute_location_codes(discretization.descriptor)
+
             # Build inverse mapping: new_index → set of old_indices.
             inv_map: dict[int, set[int]] = {}
             for old_i, new_set in enumerate(norm_mapping):
@@ -1175,23 +1249,13 @@ def compress_by_downsplit_coarsening(
                     k_abs = abs_dims.count()
                     abs_dims_list = get_refined_dimensions_desc(abs_dims)
 
-                    old_branch, _ = old_disc.descriptor.get_branch(
-                        child_hi, is_box_index=False
-                    )
-                    old_loc = dyada.discretization.branch_to_location_code(
-                        old_branch, linearization
-                    )
+                    old_loc = old_loc_codes[child_hi]
 
                     for ni in candidate_new:
                         new_ref = ba.bitarray(discretization.descriptor[ni])
                         if new_ref != remaining_child_ref:
                             continue
-                        new_branch, _ = discretization.descriptor.get_branch(
-                            ni, is_box_index=False
-                        )
-                        new_loc = dyada.discretization.branch_to_location_code(
-                            new_branch, linearization
-                        )
+                        new_loc = new_loc_codes[ni]
                         d_position = ba.bitarray(k_abs)
                         d_position.setall(0)
                         for local_i, gdim in enumerate(abs_dims_list):
