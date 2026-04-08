@@ -8,6 +8,12 @@ import numpy as np
 import dyada.descriptor
 import dyada.discretization
 import dyada.linearization
+
+try:
+    from wavelets_with_omnitrees.dyada_cache_patch import install as _install_cache
+except ModuleNotFoundError:
+    from dyada_cache_patch import install as _install_cache  # type: ignore
+_install_cache()
 from wavelets_with_omnitrees import (
     transform_to_all_wavelet_coefficients,
     get_leaf_scalings,
