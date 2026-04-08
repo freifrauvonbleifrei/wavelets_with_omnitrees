@@ -22,6 +22,12 @@ import dyada.discretization
 import dyada.linearization
 
 try:
+    from wavelets_with_omnitrees.dyada_cache_patch import install as _install_cache
+except ModuleNotFoundError:
+    from dyada_cache_patch import install as _install_cache  # type: ignore
+_install_cache()
+
+try:
     from wavelets_with_omnitrees.thingies_with_wavelets_and_omnitrees import (
         THINGIES as _THINGIES_BY_NAME,
         midpoint_occupancy_coefficients,
