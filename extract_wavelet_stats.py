@@ -61,6 +61,7 @@ COLUMNS = [
     "vdb_active_tiles",
     "vdb_total_leaf_coefficients",
     "vdb_total_coefficients",
+    "vdb_file_bytes",
 ]
 
 
@@ -217,6 +218,7 @@ def process_one(thingi_id, level, files):
     
     # OpenVDB (all stats from the C++ vdb_topology_bits tool)
     if "openvdb" in files:
+        row["vdb_file_bytes"] = os.path.getsize(files["openvdb"])
         vdb_stats = openvdb_topology_bits(files["openvdb"])
         if vdb_stats:
             row["vdb_topo_bits"] = vdb_stats.get("total_topology_bits")
