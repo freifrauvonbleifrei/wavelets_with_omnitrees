@@ -41,6 +41,8 @@ try:
         _compute_node_levels,
         compress_by_omnitree_coarsening,
         compress_by_downsplit_coarsening,
+        omnitree_from_vdb,
+        read_vdb_grid,
     )
 except ModuleNotFoundError:
     from wavelets_with_omnitrees import (  # type: ignore
@@ -49,22 +51,12 @@ except ModuleNotFoundError:
         _compute_node_levels,
         compress_by_omnitree_coarsening,
         compress_by_downsplit_coarsening,
+        omnitree_from_vdb,
+        read_vdb_grid,
     )
 
 
 # ── VDB helpers ─────────────────────────────────────────────────────────────
-
-
-def read_vdb_grid(vdb_path: str, grid_name: str):
-    """Read a named grid from a VDB file."""
-    grids, _metadata = vdb.readAll(vdb_path)
-    for g in grids:
-        if g.name == grid_name:
-            return g
-    names = [g.name for g in grids]
-    raise ValueError(
-        f"Grid '{grid_name}' not found in {vdb_path}. Available: {names}"
-    )
 
 
 def vdb_grid_extent(grid) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -83,112 +75,6 @@ def levels_from_extent(extent: np.ndarray) -> np.ndarray:
 
 _LEAF_3D = ba.frozenbitarray("000")
 _FULL_SPLIT_3D = ba.frozenbitarray("111")
-
-_MAX_CHECK_VOL = 128 ** 3
-
-
-def omnitree_from_vdb(
-    grid,
-    bbox_min: np.ndarray,
-    per_dim_levels: np.ndarray,
-) -> tuple[dyada.discretization.Discretization, np.ndarray]:
-    """Build an adaptive omnitree from a VDB grid with per-dimension levels.
-
-    Queries VDB directly without allocating the full dense array.
-    Regions outside the active bounding box are immediately collapsed to
-    background-valued leaves.  Small sub-regions are checked for uniformity
-    via copyToArray into a temporary buffer.
-
-    When per-dimension levels differ, the tree uses partial refinements
-    (e.g. "101" instead of "111") once a dimension reaches its finest level.
-    """
-    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
-    background = float(grid.background)
-
-    # Active bounding box in *local* coordinates (relative to bbox_min)
-    ab_min_global, ab_max_global = grid.evalActiveVoxelBoundingBox()
-    ab_min = np.array(ab_min_global, dtype=np.int64) - bbox_min
-    ab_max = np.array(ab_max_global, dtype=np.int64) + 1 - bbox_min  # exclusive
-
-    shape_str = " × ".join(str(s) for s in grid_shape)
-    print(f"  Grid: {shape_str}, active local range: {ab_min} .. {ab_max}")
-
-    # Global offset for copyToArray ijk parameter
-    gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
-
-    descriptor_bits = ba.bitarray()
-    leaf_values: list[float] = []
-
-    _LEAF = ba.frozenbitarray("000")
-
-    def _recurse(x0: int, y0: int, z0: int,
-                 sx: int, sy: int, sz: int) -> None:
-        # Fast path: entirely outside active bounding box → background leaf
-        if (x0 >= ab_max[0] or x0 + sx <= ab_min[0] or
-            y0 >= ab_max[1] or y0 + sy <= ab_min[1] or
-            z0 >= ab_max[2] or z0 + sz <= ab_min[2]):
-            descriptor_bits.extend(_LEAF)
-            leaf_values.append(background)
-            return
-
-        if sx == 1 and sy == 1 and sz == 1:
-            descriptor_bits.extend(_LEAF)
-            acc = grid.getConstAccessor()
-            val = acc.getValue((gx + x0, gy + y0, gz + z0))
-            leaf_values.append(float(val))
-            return
-
-        # For small-enough regions, copy and check uniformity
-        if sx * sy * sz <= _MAX_CHECK_VOL:
-            buf = np.full((sx, sy, sz), background, dtype=np.float32)
-            grid.copyToArray(buf, ijk=(gx + x0, gy + y0, gz + z0))
-            if buf.min() == buf.max():
-                descriptor_bits.extend(_LEAF)
-                leaf_values.append(float(buf.flat[0]))
-                return
-
-        # Determine which dimensions to split (those with size > 1)
-        can_split = [sx > 1, sy > 1, sz > 1]
-        ref = ba.bitarray(can_split)
-        descriptor_bits.extend(ref)
-
-        child_sx = sx // 2 if can_split[0] else sx
-        child_sy = sy // 2 if can_split[1] else sy
-        child_sz = sz // 2 if can_split[2] else sz
-
-        refined_dims = [d for d in range(3) if can_split[d]]
-        num_children = 1 << len(refined_dims)
-
-        for child_idx in range(num_children):
-            cx, cy, cz = x0, y0, z0
-            for bit, d in enumerate(refined_dims):
-                if (child_idx >> bit) & 1:
-                    if d == 0:
-                        cx += child_sx
-                    elif d == 1:
-                        cy += child_sy
-                    else:
-                        cz += child_sz
-            _recurse(cx, cy, cz, child_sx, child_sy, child_sz)
-
-    max_level = int(max(per_dim_levels))
-    sys.setrecursionlimit(max(sys.getrecursionlimit(), max_level + 100))
-    _recurse(0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])
-
-    descriptor = dyada.descriptor.RefinementDescriptor.from_binary(
-        3, descriptor_bits
-    )
-    discretization = dyada.discretization.Discretization(
-        dyada.linearization.MortonOrderLinearization(), descriptor
-    )
-    values = np.array(leaf_values, dtype=np.float64)
-
-    assert len(values) == len(discretization), (
-        f"leaf count mismatch: {len(values)} values vs "
-        f"{len(discretization)} boxes in descriptor"
-    )
-
-    return discretization, values
 
 
 # ── Stats ──────────────────────────────────────────────────────────────────

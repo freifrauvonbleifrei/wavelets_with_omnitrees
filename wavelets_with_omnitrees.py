@@ -1415,3 +1415,265 @@ if __name__ == "__main__":
     ic(str(discretization))
     # Compression decisions are coefficient-local, not direct pixel-error bounded.
     # coarsen leaves with low coefficients until compression ratio is reached #TODO
+
+
+_MAX_CHECK_VOL = 128**3
+
+
+def read_vdb_grid(vdb_path: str, grid_name: str):
+    """Read a named grid from a VDB file."""
+    import openvdb as vdb  # lazy
+
+    grids, _metadata = vdb.readAll(vdb_path)
+    for g in grids:
+        if g.name == grid_name:
+            return g
+    names = [g.name for g in grids]
+    raise ValueError(f"Grid '{grid_name}' not found in {vdb_path}. Available: {names}")
+
+
+def omnitree_from_vdb(
+    grid,
+    bbox_min: np.ndarray,
+    per_dim_levels: np.ndarray,
+) -> "tuple[dyada.discretization.Discretization, np.ndarray]":
+    """Build an adaptive omnitree from a VDB grid with per-dimension levels.
+
+    Queries VDB directly without allocating the full dense array.
+    Regions outside the active bounding box are immediately collapsed to
+    background-valued leaves.  Small sub-regions are checked for uniformity
+    via copyToArray into a temporary buffer.
+
+    When per-dimension levels differ, the tree uses partial refinements
+    (e.g. "101" instead of "111") once a dimension reaches its finest level.
+    """
+    import sys
+
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
+    background = float(grid.background)
+
+    # Active bounding box in *local* coordinates (relative to bbox_min)
+    ab_min_global, ab_max_global = grid.evalActiveVoxelBoundingBox()
+    ab_min = np.array(ab_min_global, dtype=np.int64) - bbox_min
+    ab_max = np.array(ab_max_global, dtype=np.int64) + 1 - bbox_min  # exclusive
+
+    shape_str = " × ".join(str(s) for s in grid_shape)
+    print(f"  Grid: {shape_str}, active local range: {ab_min} .. {ab_max}")
+
+    # Global offset for copyToArray ijk parameter
+    gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
+
+    descriptor_bits = ba.bitarray()
+    leaf_values: list[float] = []
+
+    _LEAF = ba.frozenbitarray("000")
+
+    def _recurse(x0: int, y0: int, z0: int, sx: int, sy: int, sz: int) -> None:
+        # Fast path: entirely outside active bounding box → background leaf
+        if (
+            x0 >= ab_max[0]
+            or x0 + sx <= ab_min[0]
+            or y0 >= ab_max[1]
+            or y0 + sy <= ab_min[1]
+            or z0 >= ab_max[2]
+            or z0 + sz <= ab_min[2]
+        ):
+            descriptor_bits.extend(_LEAF)
+            leaf_values.append(background)
+            return
+
+        if sx == 1 and sy == 1 and sz == 1:
+            descriptor_bits.extend(_LEAF)
+            acc = grid.getConstAccessor()
+            val = acc.getValue((gx + x0, gy + y0, gz + z0))
+            leaf_values.append(float(val))
+            return
+
+        # For small-enough regions, copy and check uniformity
+        if sx * sy * sz <= _MAX_CHECK_VOL:
+            buf = np.full((sx, sy, sz), background, dtype=np.float32)
+            grid.copyToArray(buf, ijk=(gx + x0, gy + y0, gz + z0))
+            if buf.min() == buf.max():
+                descriptor_bits.extend(_LEAF)
+                leaf_values.append(float(buf.flat[0]))
+                return
+
+        # Determine which dimensions to split (those with size > 1)
+        can_split = [sx > 1, sy > 1, sz > 1]
+        ref = ba.bitarray(can_split)
+        descriptor_bits.extend(ref)
+
+        child_sx = sx // 2 if can_split[0] else sx
+        child_sy = sy // 2 if can_split[1] else sy
+        child_sz = sz // 2 if can_split[2] else sz
+
+        refined_dims = [d for d in range(3) if can_split[d]]
+        num_children = 1 << len(refined_dims)
+
+        for child_idx in range(num_children):
+            cx, cy, cz = x0, y0, z0
+            for bit, d in enumerate(refined_dims):
+                if (child_idx >> bit) & 1:
+                    if d == 0:
+                        cx += child_sx
+                    elif d == 1:
+                        cy += child_sy
+                    else:
+                        cz += child_sz
+            _recurse(cx, cy, cz, child_sx, child_sy, child_sz)
+
+    max_level = int(max(per_dim_levels))
+    sys.setrecursionlimit(max(sys.getrecursionlimit(), max_level + 100))
+    _recurse(0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])
+
+    descriptor = dyada.descriptor.RefinementDescriptor.from_binary(3, descriptor_bits)
+    discretization = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(), descriptor
+    )
+    values = np.array(leaf_values, dtype=np.float64)
+
+    assert len(values) == len(discretization), (
+        f"leaf count mismatch: {len(values)} values vs "
+        f"{len(discretization)} boxes in descriptor"
+    )
+
+    return discretization, values
+
+
+def stream_inside_fn_to_float_vdb(
+    inside_fn: Callable[[np.ndarray], np.ndarray],
+    level: int,
+):
+    """Build a VDB FloatGrid from inside_fn, sampling slice-by-slice.
+
+    Avoids manifesting a full ``dims^3`` array: at any time only a single
+    z-slice (``dims*dims`` floats) is in memory before being bulk-loaded
+    into the grid via ``copyFromArray``. The grid can then be passed to
+    :func:`omnitree_from_vdb`.
+    """
+    import openvdb as vdb  # lazy
+
+    dims = 1 << level
+    voxel_size = 1.0 / dims
+    grid = vdb.FloatGrid(0.0)
+    grid.transform = vdb.createLinearTransform(voxel_size)
+
+    ij = np.mgrid[0:dims, 0:dims]
+    base_x = (ij[0].ravel() + 0.5) * voxel_size
+    base_y = (ij[1].ravel() + 0.5) * voxel_size
+
+    for k in range(dims):
+        midpoints = np.column_stack(
+            [
+                base_x,
+                base_y,
+                np.full(dims * dims, (k + 0.5) * voxel_size),
+            ]
+        )
+        slice_arr = inside_fn(midpoints).astype(np.float32).reshape(dims, dims, 1)
+        grid.copyFromArray(slice_arr, ijk=(0, 0, k))
+    grid.pruneInactive()
+    return grid
+
+
+def build_subtree_end(descriptor) -> np.ndarray:
+    """Precompute subtree_end[i] = first index after the subtree rooted at i.
+
+    For leaves, subtree_end[i] = i+1.  For inner nodes, subtree_end[i] is
+    obtained by walking forward through the children.  Computed in a single
+    backward pass.
+    """
+    n = len(descriptor)
+    subtree_end = np.empty(n, dtype=np.int64)
+    i = n - 1
+    while i >= 0:
+        ref = descriptor[i]
+        if ref.count() == 0:
+            subtree_end[i] = i + 1
+        else:
+            child_start = i + 1
+            for _ in range(1 << ref.count()):
+                child_start = int(subtree_end[child_start])
+            subtree_end[i] = child_start
+        i -= 1
+    return subtree_end
+
+
+def fill_omnitree_into_vdb(
+    grid,
+    discretization: "dyada.discretization.Discretization",
+    leaf_values: np.ndarray,
+    per_dim_levels: Sequence[int],
+    bbox_min: np.ndarray,
+    value_transform: Optional[Callable[[float], object]] = None,
+    skip_value: object = None,
+) -> None:
+    """Fill a VDB grid by calling ``grid.fill()`` once per omnitree leaf region.
+
+    Works for any VDB grid type (e.g. FloatGrid, BoolGrid). The caller creates
+    the grid (so the type and background are under their control); this helper
+    walks the descriptor and writes one fill per leaf.
+
+    ``value_transform`` (if given) converts the raw float leaf value to the
+    grid's value type — e.g. ``lambda v: v > 0.5`` for a BoolGrid.
+    Fills are skipped where the (transformed) value equals ``skip_value``.
+    """
+    if value_transform is None:
+        value_transform = lambda v: v
+    descriptor = discretization.descriptor
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
+    gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
+    subtree_end = build_subtree_end(descriptor)
+
+    stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
+    leaf_idx = 0
+
+    while stack:
+        desc_i, ox, oy, oz, sx, sy, sz = stack.pop()
+        ref = descriptor[desc_i]
+
+        if ref.count() == 0:
+            raw_val = float(leaf_values[leaf_idx])
+            leaf_idx += 1
+            val = value_transform(raw_val)
+            if skip_value is None or val != skip_value:
+                grid.fill(
+                    (gx + ox, gy + oy, gz + oz),
+                    (gx + ox + sx - 1, gy + oy + sy - 1, gz + oz + sz - 1),
+                    val,
+                )
+            continue
+
+        csx, csy, csz = sx, sy, sz
+        if ref[0]:
+            csx //= 2
+        if ref[1]:
+            csy //= 2
+        if ref[2]:
+            csz //= 2
+
+        num_children = 1 << ref.count()
+        child_desc = desc_i + 1
+        child_entries = []
+        for child_idx in range(num_children):
+            cox, coy, coz = ox, oy, oz
+            local_bit = 0
+            for d in range(3):
+                if ref[d]:
+                    if (child_idx >> local_bit) & 1:
+                        if d == 0:
+                            cox += csx
+                        elif d == 1:
+                            coy += csy
+                        else:
+                            coz += csz
+                    local_bit += 1
+            child_entries.append((child_desc, cox, coy, coz, csx, csy, csz))
+            child_desc = int(subtree_end[child_desc])
+
+        for entry in reversed(child_entries):
+            stack.append(entry)
+
+    assert leaf_idx == len(
+        leaf_values
+    ), f"leaf traversal mismatch: visited {leaf_idx}, expected {len(leaf_values)}"
