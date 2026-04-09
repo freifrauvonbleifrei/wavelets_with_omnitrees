@@ -16,6 +16,7 @@ try:
 except ImportError:
     HAS_OPENVDB = False
 
+
 import dyada
 import dyada.descriptor
 import dyada.discretization
@@ -39,6 +40,10 @@ try:
         compress_by_omnitree_coarsening,
         compress_by_downsplit_coarsening,
         compress_by_level_sweep_coarsening,
+        omnitree_from_vdb,
+        read_vdb_grid,
+        stream_inside_fn_to_float_vdb,
+        fill_omnitree_into_vdb,
     )
 except ModuleNotFoundError:
     from thingies_with_wavelets_and_omnitrees import (  # type: ignore
@@ -52,6 +57,10 @@ except ModuleNotFoundError:
         compress_by_omnitree_coarsening,
         compress_by_downsplit_coarsening,
         compress_by_level_sweep_coarsening,
+        omnitree_from_vdb,
+        read_vdb_grid,
+        stream_inside_fn_to_float_vdb,
+        fill_omnitree_into_vdb,
     )
 
 try:
@@ -199,28 +208,26 @@ def openvdb_topology_bits(vdb_file: str, grid_name: str | None = None) -> dict:
     return dict(grids)
 
 
-def midpoint_occupancy_openvdb(inside_fn, level: int):
-    voxel_size = 2.0 ** (-level)
-    dims = 1 << level
+def _write_inside_bool_vdb(disc_init, init_leaf_vals, level: int, vdb_path: str):
+    """Write a sparse VDB BoolGrid for the binary inside-occupancy data.
+
+    Uses fill_omnitree_into_vdb so the BoolGrid is built from the adaptive
+    omnitree's leaves directly via grid.fill() — no dense intermediate.
+    """
+    voxel_size = 1.0 / (1 << level)
     grid = vdb.BoolGrid(False)
     grid.name = "inside"
     grid.transform = vdb.createLinearTransform(voxel_size)
-    acc = grid.getAccessor()
-    for i in range(dims):
-        for j in range(dims):
-            for k in range(dims):
-                midpoint = np.array(
-                    [
-                        (i + 0.5) * voxel_size,
-                        (j + 0.5) * voxel_size,
-                        (k + 0.5) * voxel_size,
-                    ],
-                    dtype=np.float64,
-                )
-                if inside_fn(midpoint.reshape(1, 3))[0]:
-                    acc.setValueOn((i, j, k), True)
-    grid.pruneInactive()
-    return grid
+    fill_omnitree_into_vdb(
+        grid,
+        disc_init,
+        init_leaf_vals,
+        [level] * 3,
+        np.array([0, 0, 0], dtype=np.int64),
+        value_transform=lambda v: bool(v > 0.5),
+        skip_value=False,
+    )
+    vdb.write(vdb_path, grids=[grid])
 
 
 def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
@@ -252,9 +259,9 @@ def _sample_at_finest_midpoints(
 ) -> np.ndarray:
     """Sample inside_fn at a finest-level midpoint within each leaf box.
 
-    For each leaf, uses the lower-bound corner offset by half the finest-level
-    voxel size, so the sample point coincides exactly with one of the
-    finest-level midpoints used during full-grid initialization.
+    Fallback path used only when OpenVDB is not available; the VDB-backed
+    pipeline reads leaf values from the on-disk grid via
+    _read_leaf_values_from_vdb instead.
     """
     n_boxes = len(discretization)
     dim = discretization.descriptor.get_num_dimensions()
@@ -266,6 +273,34 @@ def _sample_at_finest_midpoints(
         )
         midpoints[box_index] = interval.lower_bound + half_voxel
     return inside_fn(midpoints).astype(np.float64)
+
+
+def _read_leaf_values_from_vdb(
+    discretization: dyada.discretization.Discretization,
+    vdb_grid,
+    level: int,
+) -> np.ndarray:
+    """Read one voxel value per leaf from a VDB grid.
+
+    Looks up the lower-corner voxel of each leaf region. This is correct for
+    trees built from uniform-region collapsing (e.g. via omnitree_from_vdb),
+    where each leaf region holds a single value across all of its voxels.
+    """
+    n_boxes = len(discretization)
+    finest_dims = 1 << level
+    leaf_values = np.empty(n_boxes, dtype=np.float64)
+    acc = vdb_grid.getConstAccessor()
+    for box_index in range(n_boxes):
+        interval = dyada.discretization.coordinates_from_box_index(
+            discretization, box_index
+        )
+        ijk = (
+            int(round(float(interval.lower_bound[0]) * finest_dims)),
+            int(round(float(interval.lower_bound[1]) * finest_dims)),
+            int(round(float(interval.lower_bound[2]) * finest_dims)),
+        )
+        leaf_values[box_index] = float(acc.getValue(ijk))
+    return leaf_values
 
 
 def _hierarchize_on_tree(
@@ -334,22 +369,72 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
             reference_binary = full_occupancy >= 0.5
 
-    if need_canonical:
-        # Must start from full grid
-        full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
-        reference_binary = full_occupancy >= 0.5
-        coefficients = _hierarchize_on_tree(full_discretization, full_occupancy)
+    # ── Build the adaptive omnitree from inside_fn (no full dense array),
+    #    write the OpenVDB file from those leaves, then load it back from disk.
+    # Any subsequent pipeline step (canonical / downsplit / level_sweep) reads
+    # leaf values from this loaded grid instead of resampling inside_fn.
+    disc_init = init_leaf_vals = None
+    loaded_vdb_grid = None
+    needs_any_vdb = HAS_OPENVDB and (
+        need_openvdb or need_canonical or need_downsplit or need_level_sweep
+    )
 
-        disc_can, coeff_can = compress_by_omnitree_coarsening(
-            full_discretization,
-            [list(c) for c in coefficients],
-            coarsening_threshold=0.0,
-        )
+    if needs_any_vdb:
+        # Mirroring compare_cloud's flow: stream inside_fn into a FloatGrid
+        # slice-by-slice (no dims^3 dense array), then build the adaptive
+        # octree via omnitree_from_vdb. The same omnitree feeds both the
+        # OpenVDB output (a sparse BoolGrid via fill_omnitree_into_vdb) and
+        # the canonical/downsplit/level_sweep pipeline below.
+        if need_canonical or not vdb_file.exists():
+            float_grid = stream_inside_fn_to_float_vdb(inside_fn, level)
+            disc_init, init_leaf_vals = omnitree_from_vdb(
+                float_grid,
+                np.array([0, 0, 0], dtype=np.int64),
+                np.array([level] * dimensionality),
+            )
+            del float_grid
+        if not vdb_file.exists():
+            _write_inside_bool_vdb(disc_init, init_leaf_vals, level, str(vdb_file))
+        if need_openvdb:
+            openvdb_stats = openvdb_topology_bits(str(vdb_file))
+            results["openvdb"] = (
+                openvdb_stats["inside"]["total_topology_bits"],
+                openvdb_stats["inside"]["dense_value_bytes"],
+            )
+        loaded_vdb_grid = read_vdb_grid(str(vdb_file), "inside")
+
+    if need_canonical:
+        if HAS_OPENVDB:
+            # Hierarchize on the adaptive (octree) tree, then canonical-coarsen
+            # to recover the anisotropic refinements that compress_by_omnitree
+            # would have produced from a full-grid start.
+            init_coefficients = _hierarchize_on_tree(disc_init, init_leaf_vals)
+            disc_can, coeff_can = compress_by_omnitree_coarsening(
+                disc_init,
+                [list(c) for c in init_coefficients],
+                coarsening_threshold=0.0,
+            )
+        else:
+            # Fallback: full grid hierarchization + canonical coarsening
+            full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
+            reference_binary = full_occupancy >= 0.5
+            coefficients = _hierarchize_on_tree(full_discretization, full_occupancy)
+            disc_can, coeff_can = compress_by_omnitree_coarsening(
+                full_discretization,
+                [list(c) for c in coefficients],
+                coarsening_threshold=0.0,
+            )
     elif need_downsplit or need_level_sweep:
         # Canonical exists — load and reconstruct coefficients
         disc_can = _load_discretization(canonical_file)
-        leaf_values = _sample_at_finest_midpoints(disc_can, inside_fn, level)
+        if HAS_OPENVDB:
+            leaf_values = _read_leaf_values_from_vdb(disc_can, loaded_vdb_grid, level)
+        else:
+            leaf_values = _sample_at_finest_midpoints(disc_can, inside_fn, level)
         coeff_can = _hierarchize_on_tree(disc_can, leaf_values)
+
+    # free the initial-tree memory once canonical work is done
+    disc_init = init_leaf_vals = None
 
     if need_canonical:
         _ensure_reference_binary()
@@ -370,7 +455,10 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     elif need_level_sweep:
         # Pushdown exists — load and reconstruct coefficients
         disc_pd = _load_discretization(downsplit_file)
-        leaf_values = _sample_at_finest_midpoints(disc_pd, inside_fn, level)
+        if HAS_OPENVDB:
+            leaf_values = _read_leaf_values_from_vdb(disc_pd, loaded_vdb_grid, level)
+        else:
+            leaf_values = _sample_at_finest_midpoints(disc_pd, inside_fn, level)
         coeff_pd = _hierarchize_on_tree(disc_pd, leaf_values)
 
     if need_downsplit:
@@ -396,17 +484,6 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         results["level_sweep"] = (nd * dimensionality, nb)
         reconstructions["level_sweep"] = recon
         descriptors["level_sweep"] = disc_ls.descriptor
-
-    # ── OpenVDB ──────────────────────────────────────────────────────────────
-    if need_openvdb:
-        openvdb_grid = midpoint_occupancy_openvdb(inside_fn, level=level)
-        vdb_path = str(vdb_file)
-        vdb.write(vdb_path, grids=[openvdb_grid])
-        openvdb_stats = openvdb_topology_bits(vdb_path)
-        results["openvdb"] = (
-            openvdb_stats["inside"]["total_topology_bits"],
-            openvdb_stats["inside"]["dense_value_bytes"],
-        )
 
     # ── Print ────────────────────────────────────────────────────────────────
     if results:
