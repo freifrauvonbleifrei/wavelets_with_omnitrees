@@ -375,8 +375,10 @@ def compress_by_omnitree_coarsening(
             if not any(len(current_coefficients[c]) > 1 for c in children_indices):
                 parent_coefficients = current_coefficients[desc_i]
                 branch_level = node_levels[desc_i].astype(np.int64)
-                box_volume = float(np.prod(np.power(2.0, -branch_level)))
-                local_bound = phase_threshold * box_volume
+                # local_bound = threshold * 2^(+sum(per_dim_levels))
+                local_bound = phase_threshold * float(
+                    np.prod(np.power(2.0, branch_level))
+                )
 
                 if abs(parent_coefficients[-1]) <= local_bound:
                     if sum(abs(v) for v in parent_coefficients[1:]) <= local_bound:
@@ -974,8 +976,9 @@ def compress_by_downsplit_coarsening(
                 len(coefficients[c]) > 1 for c in children_indices
             ):
                 branch_level = node_levels[coarsen_desc_i].astype(np.int64)
+                # local_bound = threshold * 2^(+sum(per_dim_levels))
                 local_bound = coarsening_threshold * float(
-                    np.prod(np.power(2.0, -branch_level))
+                    np.prod(np.power(2.0, branch_level))
                 )
                 if all(
                     abs(coefficients[coarsen_desc_i][j]) <= local_bound
