@@ -86,7 +86,7 @@ print()
 for threshold in THRESHOLDS:
     print(f"threshold={threshold:.0e}")
 
-    disc_a, coeff_a = compress_by_omnitree_coarsening(
+    disc_a, coeff_a, _ = compress_by_omnitree_coarsening(
         discretization0,
         copy.deepcopy(coefficients0),
         coarsening_threshold=threshold,

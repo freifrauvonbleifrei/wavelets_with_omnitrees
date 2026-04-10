@@ -700,7 +700,7 @@ def main():
 
         print("  Omnitree coarsening...", end="", flush=True)
         sys.stdout.flush()
-        disc_can, coeff_can = compress_by_omnitree_coarsening(
+        disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
             adaptive_disc,
             [list(c) for c in coefficients],
             coarsening_threshold=threshold,
@@ -714,7 +714,7 @@ def main():
 
         print("  Downsplit coarsening...", end="", flush=True)
         sys.stdout.flush()
-        disc_ds, coeff_ds = compress_by_downsplit_coarsening(
+        disc_ds, coeff_ds, _ = compress_by_downsplit_coarsening(
             disc_can,
             [list(c) for c in coeff_can],
             coarsening_threshold=threshold,

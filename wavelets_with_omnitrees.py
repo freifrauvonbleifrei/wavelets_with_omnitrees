@@ -335,12 +335,149 @@ def get_local_bit_index(
     return refined_dimensions_desc.index(global_dimension)
 
 
+def _coarsening_round(
+    discretization: dyada.discretization.Discretization,
+    coefficients: list[Sequence[float]],
+    coarsening_threshold: float,
+    num_dimensions: int,
+    *,
+    allow_partial: bool = False,
+) -> tuple[
+    dyada.discretization.Discretization,
+    list[Sequence[float]],
+    bool,
+    float,
+]:
+    """Single backward-walk coarsening pass shared by omnitree and downsplit.
+
+    For each interior node whose children are all leaves, coarsen if every
+    detail coefficient satisfies ``|d_j| <= coarsening_threshold / box_volume``.
+    When *allow_partial* is True and the full coarsening check fails, fall back
+    to coarsening individual dimensions whose details are within the bound.
+
+    Returns ``(discretization, coefficients, changed, round_discarded_l1)``.
+    """
+    p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
+    planned_any = False
+    round_discarded_l1 = 0.0
+    descriptor = discretization.descriptor
+    node_levels = _compute_node_levels(descriptor)
+
+    stack: list[int] = []
+    desc_i = len(descriptor) - 1
+    for current_ref in reversed(descriptor):
+        k = current_ref.count()
+        if k == 0:
+            stack.append(desc_i)
+            desc_i -= 1
+            continue
+
+        num_children = 1 << k
+        children_indices = [stack.pop() for _ in range(num_children)]
+
+        if not any(len(coefficients[c]) > 1 for c in children_indices):
+            parent_coefficients = coefficients[desc_i]
+            branch_level = node_levels[desc_i].astype(np.int64)
+            box_volume = float(np.prod(np.power(2.0, -branch_level)))
+            local_bound = coarsening_threshold / box_volume
+
+            if all(
+                abs(parent_coefficients[j]) <= local_bound
+                for j in range(1, 1 << k)
+            ):
+                p.plan_coarsening(desc_i, ba.bitarray(current_ref))
+                planned_any = True
+                for j in range(1, 1 << k):
+                    round_discarded_l1 += abs(parent_coefficients[j]) * box_volume
+            elif allow_partial:
+                refined_dims = get_refined_dimensions_desc(current_ref)
+                for global_dim in refined_dims:
+                    local_bit_idx = get_local_bit_index(global_dim, refined_dims)
+                    h_indices = get_numbers_with_ith_bit_set(local_bit_idx, k)
+                    if all(
+                        abs(parent_coefficients[i_h]) <= local_bound
+                        for i_h in h_indices
+                    ):
+                        one_d = ba.bitarray("0" * num_dimensions)
+                        one_d[global_dim] = 1
+                        p.plan_coarsening(desc_i, one_d)
+                        planned_any = True
+                        for i_h in h_indices:
+                            round_discarded_l1 += abs(parent_coefficients[i_h]) * box_volume
+
+        stack.append(desc_i)
+        desc_i -= 1
+
+    if not planned_any:
+        return discretization, coefficients, False, 0.0
+
+    old_disc = discretization
+    discretization, mapping = p.apply_refinements(
+        track_mapping="patches", sweep_mode="canonical"
+    )
+    final_markers = p._markers
+    if __debug__:
+        dyada.descriptor.validate_descriptor(discretization.descriptor)
+
+    new_coefficients: list[Sequence[float]] = [
+        [np.nan] for _ in range(len(discretization.descriptor))
+    ]
+    inverted_mapping: dict[int, set[int]] = {}
+    for old_index, mapped_to in enumerate(mapping):
+        for new_index in mapped_to:
+            inverted_mapping.setdefault(new_index, set()).add(old_index)
+
+    for new_index, mapped_from in inverted_mapping.items():
+        expected_num_ref = discretization.descriptor[new_index].count()
+        expected_len = 1 if expected_num_ref == 0 else (1 << expected_num_ref)
+        mapped_from_sorted = sorted(mapped_from)
+        matching = [
+            oi
+            for oi in mapped_from_sorted
+            if len(coefficients[oi]) == expected_len
+        ]
+        first_found = matching[0] if matching else mapped_from_sorted[0]
+        new_coefficients[new_index] = list(coefficients[first_found])
+        if first_found not in final_markers:
+            continue
+        marker = final_markers[first_found]
+        if not np.any(marker < 0):
+            continue
+        refined_dimensions_desc = get_refined_dimensions_desc(
+            old_disc.descriptor[first_found]
+        )
+        num_ref = old_disc.descriptor[first_found].count()
+        delete_indices: set[int] = set()
+        for d_i in range(num_dimensions):
+            if marker[d_i] >= 0:
+                continue
+            local_bit_index = get_local_bit_index(d_i, refined_dimensions_desc)
+            delete_indices.update(
+                get_numbers_with_ith_bit_set(local_bit_index, num_ref)
+            )
+        new_coefficients[new_index] = list(
+            np.delete(arr=coefficients[first_found], obj=sorted(delete_indices))
+        )
+        if __debug__ and len(new_coefficients[new_index]) != expected_len:
+            raise ValueError(
+                f"Coefficient length mismatch at new index {new_index}: "
+                f"got {len(new_coefficients[new_index])}, expected {expected_len}"
+            )
+
+    return discretization, new_coefficients, True, round_discarded_l1
+
+
 def compress_by_omnitree_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
-) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
-    """Iteratively coarsen with staged coefficient-local bounds."""
+) -> tuple[dyada.discretization.Discretization, list[Sequence[float]], float]:
+    """Iteratively coarsen with staged coefficient-local bounds.
+
+    Returns ``(discretization, coefficients, discarded_l1)`` where
+    *discarded_l1* is ``sum(|d_j| * box_volume)`` over every detail
+    coefficient discarded during coarsening.
+    """
     num_dimensions = discretization.descriptor.get_num_dimensions()
 
     def apply_single_phase_round(
@@ -351,161 +488,50 @@ def compress_by_omnitree_coarsening(
         dyada.discretization.Discretization,
         list[Sequence[float]],
         bool,
+        float,
     ]:
-        p = dyada.refinement.PlannedAdaptiveRefinement(current_discretization)
-        planned_any = False
-        descriptor = current_discretization.descriptor
-        node_levels = _compute_node_levels(descriptor)
-
-        # Backwards iteration: children are visited before parents,
-        # so the stack naturally provides children indices at each parent.
-        stack: list[int] = []  # stack of descriptor indices
-        desc_i = len(descriptor) - 1
-        for current_refinement in reversed(descriptor):
-            num_refinements = current_refinement.count()
-            if num_refinements == 0:
-                stack.append(desc_i)
-                desc_i -= 1
-                continue
-
-            num_children = 1 << num_refinements
-            children_indices = [stack.pop() for _ in range(num_children)]
-
-            # Coarsening only when all direct children are leaves
-            if not any(len(current_coefficients[c]) > 1 for c in children_indices):
-                parent_coefficients = current_coefficients[desc_i]
-                branch_level = node_levels[desc_i].astype(np.int64)
-                # local_bound = threshold * 2^(+sum(per_dim_levels))
-                local_bound = phase_threshold * float(
-                    np.prod(np.power(2.0, branch_level))
-                )
-
-                if abs(parent_coefficients[-1]) <= local_bound:
-                    if sum(abs(v) for v in parent_coefficients[1:]) <= local_bound:
-                        coarsen_mask = ba.bitarray(descriptor[desc_i])
-                        p.plan_coarsening(desc_i, coarsen_mask)
-                        planned_any = True
-                    else:
-                        refined_dimensions_desc = get_refined_dimensions_desc(
-                            current_refinement
-                        )
-                        for global_dimension in refined_dimensions_desc:
-                            local_bit_index = get_local_bit_index(
-                                global_dimension, refined_dimensions_desc
-                            )
-                            hierarchical_indices = get_numbers_with_ith_bit_set(
-                                local_bit_index, num_refinements
-                            )
-                            hierarchical_abs_values = [
-                                abs(parent_coefficients[i_h])
-                                for i_h in hierarchical_indices
-                            ]
-                            if sum(hierarchical_abs_values) <= local_bound:
-                                one_d_refinement = ba.bitarray("0" * num_dimensions)
-                                one_d_refinement[global_dimension] = 1
-                                p.plan_coarsening(desc_i, one_d_refinement)
-                                planned_any = True
-
-            stack.append(desc_i)
-            desc_i -= 1
-
-        if not planned_any:
-            return current_discretization, current_coefficients, False
-
-        new_discretization, mapping = p.apply_refinements(
-            track_mapping="patches", sweep_mode="canonical"
+        return _coarsening_round(
+            current_discretization,
+            current_coefficients,
+            phase_threshold,
+            num_dimensions,
+            allow_partial=True,
         )
-        final_markers = p._markers
-        if __debug__:
-            dyada.descriptor.validate_descriptor(new_discretization.descriptor)
-
-        new_coefficients: list[Sequence[float]] = [
-            [np.nan] for _ in range(len(new_discretization.descriptor))
-        ]
-        inverted_mapping: dict[int, set[int]] = {}
-        for old_index, mapped_to in enumerate(mapping):
-            for new_index in mapped_to:
-                inverted_mapping.setdefault(new_index, set()).add(old_index)
-
-        for new_index, mapped_from in inverted_mapping.items():
-            expected_num_refinements = new_discretization.descriptor[new_index].count()
-            expected_len = (
-                1 if expected_num_refinements == 0 else (1 << expected_num_refinements)
-            )
-            mapped_from_sorted = sorted(mapped_from)
-            matching_old_indices = [
-                old_i
-                for old_i in mapped_from_sorted
-                if len(current_coefficients[old_i]) == expected_len
-            ]
-            first_found_old_index = (
-                matching_old_indices[0]
-                if matching_old_indices
-                else mapped_from_sorted[0]
-            )
-            new_coefficients[new_index] = list(
-                current_coefficients[first_found_old_index]
-            )
-            if first_found_old_index not in final_markers:
-                continue
-            marker = final_markers[first_found_old_index]
-            if not np.any(marker < 0):
-                continue
-
-            refined_dimensions_desc = get_refined_dimensions_desc(
-                current_discretization.descriptor[first_found_old_index]
-            )
-            num_refinements = current_discretization.descriptor[
-                first_found_old_index
-            ].count()
-            delete_indices: set[int] = set()
-            for d_i in range(num_dimensions):
-                if marker[d_i] >= 0:
-                    continue
-                local_bit_index = get_local_bit_index(d_i, refined_dimensions_desc)
-                delete_indices.update(
-                    get_numbers_with_ith_bit_set(local_bit_index, num_refinements)
-                )
-            new_coefficients[new_index] = np.delete(
-                arr=new_coefficients[new_index],
-                obj=sorted(delete_indices),
-            )
-            if len(new_coefficients[new_index]) != expected_len:
-                raise ValueError(
-                    f"Coefficient length mismatch at new index {new_index}: "
-                    f"got {len(new_coefficients[new_index])}, expected {expected_len}"
-                )
-
-        return new_discretization, new_coefficients, True
 
     def run_phase(
         phase_discretization: dyada.discretization.Discretization,
         phase_coefficients: list[Sequence[float]],
         phase_threshold: float,
-    ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
+    ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]], float]:
+        phase_discarded = 0.0
         while True:
             (
                 phase_discretization,
                 phase_coefficients,
                 changed,
+                round_discarded,
             ) = apply_single_phase_round(
                 phase_discretization,
                 phase_coefficients,
                 phase_threshold=phase_threshold,
             )
+            phase_discarded += round_discarded
             if not changed:
-                return phase_discretization, phase_coefficients
+                return phase_discretization, phase_coefficients, phase_discarded
 
-    discretization, coefficients = run_phase(
+    total_discarded = 0.0
+    discretization, coefficients, d = run_phase(
         discretization, coefficients, phase_threshold=0.0
     )
-    discretization, coefficients = run_phase(
+    total_discarded += d
+    discretization, coefficients, d = run_phase(
         discretization,
         coefficients,
         phase_threshold=coarsening_threshold,
     )
+    total_discarded += d
 
-    return discretization, coefficients
+    return discretization, coefficients, total_discarded
 
 
 @lru_cache(maxsize=None)
@@ -774,7 +800,7 @@ def compress_by_downsplit_coarsening(
     coarsening_threshold: float = 0.0,
     *,
     _depth_schedule: Iterable[int] | None = None,
-) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
+) -> tuple[dyada.discretization.Discretization, list[Sequence[float]], float]:
     """Compress via progressive bottom-up downsplit guided by 1D detail coefficients.
 
     Each round:
@@ -793,6 +819,7 @@ def compress_by_downsplit_coarsening(
 
     num_dimensions = discretization.descriptor.get_num_dimensions()
     _depth_iter = iter(_depth_schedule) if _depth_schedule is not None else None
+    total_discarded_l1 = 0.0
 
     while True:
         # ── Downsplit round ─────────────────────────────────────────────────
@@ -949,107 +976,14 @@ def compress_by_downsplit_coarsening(
 
             coefficients = new_coefficients
 
-        # ── Coarsening round ────────────────────────────────────────────────
-        p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
-        planned_any = False
-        # Recompute levels after downsplit may have changed the descriptor.
-        node_levels = _compute_node_levels(discretization.descriptor)
-
-        # Backwards iteration: children are visited before parents,
-        # so the stack naturally provides children indices at each parent.
-        coarsen_stack: list[int] = []
-        coarsen_desc_i = len(discretization.descriptor) - 1
-        for current_ref in reversed(discretization.descriptor):
-            k = current_ref.count()
-            if k == 0:
-                coarsen_stack.append(coarsen_desc_i)
-                coarsen_desc_i -= 1
-                continue
-
-            num_children = 1 << k
-            children_indices = [coarsen_stack.pop() for _ in range(num_children)]
-
-            # Sanity check: every node should have a coefficient vector
-            # whose length matches its ref count (1 for leaves, 2^k for k-dim
-            # interior nodes).
-            assert len(coefficients[coarsen_desc_i]) == (1 << k), (
-                f"node {coarsen_desc_i} ref={current_ref.to01()} k={k} "
-                f"expected len {1 << k}, got {len(coefficients[coarsen_desc_i])} "
-                f"({coefficients[coarsen_desc_i]})"
-            )
-            if __debug__:
-                for _ci in children_indices:
-                    _ck = discretization.descriptor[_ci].count()
-                    _expected = 1 if _ck == 0 else (1 << _ck)
-                    assert len(coefficients[_ci]) == _expected, (
-                        f"child {_ci} of {coarsen_desc_i}: ref="
-                        f"{discretization.descriptor[_ci].to01()} k={_ck} "
-                        f"expected len {_expected}, got {len(coefficients[_ci])} "
-                        f"({coefficients[_ci]})"
-                    )
-            # Coarsen only when all direct children are leaves.
-            if not any(len(coefficients[c]) > 1 for c in children_indices):
-                branch_level = node_levels[coarsen_desc_i].astype(np.int64)
-                # local_bound = threshold * 2^(+sum(per_dim_levels))
-                local_bound = coarsening_threshold * float(
-                    np.prod(np.power(2.0, branch_level))
-                )
-                if all(
-                    abs(coefficients[coarsen_desc_i][j]) <= local_bound
-                    for j in range(1, 1 << k)
-                ):
-                    p.plan_coarsening(coarsen_desc_i, ba.bitarray(current_ref))
-                    planned_any = True
-
-            coarsen_stack.append(coarsen_desc_i)
-            coarsen_desc_i -= 1
-
-        if planned_any:
-            old_disc = discretization
-            discretization, coarsen_mapping = p.apply_refinements(
-                track_mapping="patches", sweep_mode="canonical"
-            )
-            final_markers = p._markers
-            new_coefficients = [[np.nan] for _ in range(len(discretization.descriptor))]
-            inverted_mapping: dict[int, set[int]] = {}
-            for old_index, mapped_to in enumerate(coarsen_mapping):
-                for new_index in mapped_to:
-                    inverted_mapping.setdefault(new_index, set()).add(old_index)
-            for new_index, mapped_from in inverted_mapping.items():
-                expected_num_ref = discretization.descriptor[new_index].count()
-                expected_len = 1 if expected_num_ref == 0 else (1 << expected_num_ref)
-                mapped_from_sorted = sorted(mapped_from)
-                matching = [
-                    oi
-                    for oi in mapped_from_sorted
-                    if len(coefficients[oi]) == expected_len
-                ]
-                first_found = matching[0] if matching else mapped_from_sorted[0]
-                if first_found not in final_markers:
-                    new_coefficients[new_index] = list(coefficients[first_found])
-                    continue
-                marker = final_markers[first_found]
-                if not np.any(marker < 0):
-                    new_coefficients[new_index] = list(coefficients[first_found])
-                    continue
-                # Coarsened node: drop the detail coefficients for coarsened dims
-                # directly from the parent's existing wavelet coefficients.
-                num_ref = old_disc.descriptor[first_found].count()
-                refined_dimensions_desc = get_refined_dimensions_desc(
-                    old_disc.descriptor[first_found]
-                )
-                delete_indices: set[int] = set()
-                for d_i in range(num_dimensions):
-                    if marker[d_i] >= 0:
-                        continue
-                    local_bit_index = get_local_bit_index(d_i, refined_dimensions_desc)
-                    delete_indices.update(
-                        get_numbers_with_ith_bit_set(local_bit_index, num_ref)
-                    )
-                new_coefficients[new_index] = list(
-                    np.delete(arr=coefficients[first_found], obj=sorted(delete_indices))
-                )
-            coefficients = new_coefficients
+        # ── Coarsening round (shared with omnitree) ──────────────────────
+        discretization, coefficients, planned_any, round_discarded = _coarsening_round(
+            discretization,
+            coefficients,
+            coarsening_threshold,
+            num_dimensions,
+        )
+        total_discarded_l1 += round_discarded
 
         # ── Normalization round ──────────────────────────────────────────
         # After downsplit + coarsening the tree may contain uniqueness
@@ -1242,14 +1176,14 @@ def compress_by_downsplit_coarsening(
         if _depth_iter is None and not planned_any:
             break
 
-    return discretization, coefficients
+    return discretization, coefficients, total_discarded_l1
 
 
 def compress_by_level_sweep_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
-) -> tuple[dyada.discretization.Discretization, list[Sequence[float]]]:
+) -> tuple[dyada.discretization.Discretization, list[Sequence[float]], float]:
     """Continue compression from a downsplit result by sweeping lower depths.
 
     Expects the input to already be the result of compress_by_downsplit_coarsening
@@ -1260,6 +1194,7 @@ def compress_by_level_sweep_coarsening(
     This guarantees at least as many boxes are removed as default downsplit alone,
     since the input already is the downsplit result and this only adds work.
     """
+    total_discarded = 0.0
     # Sweep remaining multi-dim depths and re-converge
     while True:
         descriptor = discretization.descriptor
@@ -1277,22 +1212,24 @@ def compress_by_level_sweep_coarsening(
 
         old_count = len(discretization)
         # Downsplit at each remaining multi-dim depth (max down to lowest)
-        discretization, coefficients = compress_by_downsplit_coarsening(
+        discretization, coefficients, d1 = compress_by_downsplit_coarsening(
             discretization,
             [list(c) for c in coefficients],
             coarsening_threshold,
             _depth_schedule=multi_dim_depths,
         )
+        total_discarded += d1
         # Re-converge with default downsplit to exploit any new opportunities
-        discretization, coefficients = compress_by_downsplit_coarsening(
+        discretization, coefficients, d2 = compress_by_downsplit_coarsening(
             discretization,
             [list(c) for c in coefficients],
             coarsening_threshold,
         )
+        total_discarded += d2
         if len(discretization) >= old_count:
             break
 
-    return discretization, coefficients
+    return discretization, coefficients, total_discarded
 
 
 if __name__ == "__main__":
@@ -1398,7 +1335,7 @@ if __name__ == "__main__":
     ic(len(coefficients))
     assert all(len(c) > 0 for c in coefficients)
     coarsening_threshold = 1e-7
-    discretization, coefficients = compress_by_omnitree_coarsening(
+    discretization, coefficients, _ = compress_by_omnitree_coarsening(
         discretization,
         coefficients,
         coarsening_threshold=coarsening_threshold,

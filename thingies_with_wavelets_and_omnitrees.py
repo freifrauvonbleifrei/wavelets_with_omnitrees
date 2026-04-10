@@ -130,7 +130,7 @@ def run_for_thingy(thingy_name: str, inside_fn, max_level: int):
         c[0] = np.nan
     all_coefficients[0][0] = root_scaling
 
-    discretization, coefficients = compress_by_omnitree_coarsening(
+    discretization, coefficients, _ = compress_by_omnitree_coarsening(
         full_discretization,
         [list(c) for c in all_coefficients],
         coarsening_threshold=0.0,

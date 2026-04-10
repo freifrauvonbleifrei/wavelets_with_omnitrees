@@ -409,7 +409,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             # to recover the anisotropic refinements that compress_by_omnitree
             # would have produced from a full-grid start.
             init_coefficients = _hierarchize_on_tree(disc_init, init_leaf_vals)
-            disc_can, coeff_can = compress_by_omnitree_coarsening(
+            disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
                 disc_init,
                 [list(c) for c in init_coefficients],
                 coarsening_threshold=0.0,
@@ -419,13 +419,13 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
             reference_binary = full_occupancy >= 0.5
             coefficients = _hierarchize_on_tree(full_discretization, full_occupancy)
-            disc_can, coeff_can = compress_by_omnitree_coarsening(
+            disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
                 full_discretization,
                 [list(c) for c in coefficients],
                 coarsening_threshold=0.0,
             )
     elif need_downsplit or need_level_sweep:
-        disc_can, coeff_can = compress_by_omnitree_coarsening(
+        disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
             full_discretization,
             [list(c) for c in coefficients],
             coarsening_threshold=0.0,
@@ -453,7 +453,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
 
     # ── downsplit ────────────────────────────────────────────────────────────
     if need_downsplit:
-        disc_pd, coeff_pd = compress_by_downsplit_coarsening(
+        disc_pd, coeff_pd, _ = compress_by_downsplit_coarsening(
             disc_can,
             [list(c) for c in coeff_can],
             coarsening_threshold=0.0,
@@ -475,7 +475,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
 
     # ── level sweep ──────────────────────────────────────────────────────────
     #if need_level_sweep:
-    #    disc_ls, coeff_ls = compress_by_level_sweep_coarsening(
+    #    disc_ls, coeff_ls, _ = compress_by_level_sweep_coarsening(
     #        disc_pd,
     #        [list(c) for c in coeff_pd],
     #        coarsening_threshold=0.0,
