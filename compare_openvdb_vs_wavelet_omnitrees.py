@@ -379,7 +379,6 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         need_openvdb or need_canonical or need_downsplit or need_level_sweep
     )
 
-<<<<<<< Updated upstream
     if needs_any_vdb:
         # Mirroring compare_cloud's flow: stream inside_fn into a FloatGrid
         # slice-by-slice (no dims^3 dense array), then build the adaptive
