@@ -9,6 +9,8 @@ import dyada.descriptor
 import dyada.discretization
 import dyada.linearization
 
+import pytest
+
 import bitarray as ba
 
 from wavelets_with_omnitrees import (
@@ -137,53 +139,198 @@ def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
     return disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls
 
 
-def test_2d_cascading_downsplit():
-    """Test that cascading downsplit compresses a tree that single-level downsplit cannot.
-
-    The grid has matching sub-patterns across y at certain x positions,
-    which cascading downsplit detects by splitting dim 1 first (merge-preferring
-    heuristic), then further splitting the merged multi-dim child, enabling
-    coarsening where the y-detail is zero.
-    """
-    disc = _build_disc_from_descriptor_string(2, "11 00 10 10 00 00 00 00 10 00 00")
-    nodal = np.array([0, 0, 1, 1, 1, 0, 1], dtype=np.float64)
-    assert len(disc) == 7
-    assert (
-        dyada.discretization_to_2d_ascii(disc)
-        == """\
+_INSUFFICIENT_DOWNSPLIT_CANDIDATES = [
+    # ── A: minimal asymmetric (no multi-dim node, downsplit is a no-op) ──
+    # The two bot leaves and the two top leaves are adjacent same-value
+    # rectangles but live in two different `01` subtrees, so downsplit
+    # (which only operates on multi-dim nodes) cannot touch them.
+    # Level-sweep collapses to a single y-split.
+    {
+        "label": "A_minimal_no_multidim",
+        "descriptor": "10 01 00 00 01 00 00",
+        "values": [0, 1, 0, 1],
+        "init_boxes": 4,
+        "can_boxes": 4,
+        "pd_boxes": 4,
+        "ls_boxes": 2,
+        "ascii_init": """\
+_____
+|_|_|
+|_|_|""",
+        "ascii_pd": """\
+_____
+|_|_|
+|_|_|""",
+        "ascii_ls": """\
+___
+|_|
+|_|""",
+    },
+    # ── E: 2×4 horizontal stripes via two stacked A subtrees ──
+    # Same failure pattern, one level deeper: canonical coarsens the
+    # within-strip pairs (8→4) but the resulting tree is still the
+    # asymmetric layout that downsplit cannot simplify.
+    {
+        "label": "E_2x4_horizontal_stripes",
+        "descriptor": "10 01 01 00 00 01 00 00 01 01 00 00 01 00 00",
+        "values": [0, 0, 1, 1, 0, 0, 1, 1],
+        "init_boxes": 8,
+        "can_boxes": 4,
+        "pd_boxes": 4,
+        "ls_boxes": 2,
+        "ascii_init": """\
+_____
+|_|_|
+|_|_|
+|_|_|
+|_|_|""",
+        "ascii_pd": """\
+_____
+|_|_|
+|_|_|""",
+        "ascii_ls": """\
+___
+|_|
+|_|""",
+    },
+    # ── Q: 4×4 horizontal stripes via `11` root + four asymmetric quadrants ──
+    # Has a multi-dim root, so downsplit *does* try to cascade — but the four
+    # sibling subtrees are individually asymmetric and downsplit cannot
+    # restructure across them, so the tree stays at 16 nodes.  Level-sweep
+    # only manages to halve it (→8); the true optimum is 4 horizontal strips,
+    # so even level_sweep is sub-optimal here.  Reachable via descriptor
+    # ``01 01 00 00 01 00 00`` with values ``[0, 1, 0, 1]``, which renders as:
+    #
+    #     ___
+    #     |_|
+    #     |_|
+    #     |_|
+    #     |_|
+    #
+    {
+        "label": "Q_4x4_horizontal_stripes_via_11",
+        "descriptor": (
+            "11 10 01 00 00 01 00 00 10 01 00 00 01 00 00 "
+            "10 01 00 00 01 00 00 10 01 00 00 01 00 00"
+        ),
+        "values": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+        "init_boxes": 16,
+        "can_boxes": 16,
+        "pd_boxes": 16,
+        "ls_boxes": 8,
+        "ascii_init": """\
+_________
+|_|_|_|_|
+|_|_|_|_|
+|_|_|_|_|
+|_|_|_|_|""",
+        "ascii_pd": """\
+_________
+|_|_|_|_|
+|_|_|_|_|
+|_|_|_|_|
+|_|_|_|_|""",
+        "ascii_ls": """\
+_____
+|_|_|
+|_|_|
+|_|_|
+|_|_|""",
+    },
+    # ── M: original probe descriptor (no compression in the current pipeline) ──
+    # The optimum here is 6 boxes (the merged top-right column collapses Q3.r
+    # and Q1.r into a single x=0.75..1 strip), but neither downsplit nor
+    # level-sweep finds it.  Optimal:
+    #     _________________
+    #     |_______|___|   |
+    #     |_______|_|_|___|
+    #
+    {
+        "label": "M_original_probe",
+        "descriptor": "11 00 10 10 00 00 00 00 10 00 00",
+        "values": [0, 0, 1, 1, 1, 0, 1],
+        "init_boxes": 7,
+        "can_boxes": 7,
+        "pd_boxes": 7,
+        "ls_boxes": 7,
+        "ascii_init": """\
 _________________
 |_______|___|___|
-|_______|_|_|___|"""
-    )
+|_______|_|_|___|""",
+        "ascii_pd": """\
+_________________
+|_______|___|___|
+|_______|_|_|___|""",
+        "ascii_ls": """\
+_________________
+|_______|___|___|
+|_______|_|_|___|""",
+    },
+]
 
-    labels = [str(int(v)) for v in nodal]
-    _plot_tikz(disc, labels, "before")
+
+@pytest.mark.parametrize(
+    "case",
+    _INSUFFICIENT_DOWNSPLIT_CANDIDATES,
+    ids=[c["label"] for c in _INSUFFICIENT_DOWNSPLIT_CANDIDATES],
+)
+def test_2d_insufficient_downsplit(case):
+    """Probe whether downsplit reaches the level-sweep optimum on a candidate tree.
+
+    Each parametrised case represents a tree with adjacent same-size,
+    same-value leaves that *could* be merged.  We assert both the box counts
+    and the inline ASCII at the init / downsplit / level_sweep stages so
+    the missed coarsening is visible directly in the test source: a case
+    where ``ascii_pd`` and ``ascii_ls`` differ is a downsplit miss.
+    """
+    label = case["label"]
+    disc = _build_disc_from_descriptor_string(2, case["descriptor"])
+    nodal = np.array(case["values"], dtype=np.float64)
+
+    assert (
+        len(disc) == case["init_boxes"]
+    ), f"{label}: init boxes: expected {case['init_boxes']}, got {len(disc)}"
+    assert (
+        dyada.discretization_to_2d_ascii(disc) == case["ascii_init"]
+    ), f"{label}: init ascii mismatch"
 
     disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
         disc, nodal
     )
 
-    # Canonical coarsening: no change (no zero details at threshold=0)
-    assert len(disc_can) == 7
-    # Cascading downsplit: merges the top-right cell (both y-values are 1) → 7→6
-    assert len(disc_pd) == 6
-    assert len(disc_ls) == 6
     assert (
-        dyada.discretization_to_2d_ascii(disc_pd)
-        == """\
-_________________
-|_______|___|   |
-|_______|_|_|___|"""
-    )
+        len(disc_can) == case["can_boxes"]
+    ), f"{label}: canonical boxes: expected {case['can_boxes']}, got {len(disc_can)}"
+    assert (
+        len(disc_pd) == case["pd_boxes"]
+    ), f"{label}: downsplit boxes: expected {case['pd_boxes']}, got {len(disc_pd)}"
+    assert (
+        dyada.discretization_to_2d_ascii(disc_pd) == case["ascii_pd"]
+    ), f"{label}: downsplit ascii mismatch"
+    assert (
+        len(disc_ls) == case["ls_boxes"]
+    ), f"{label}: level_sweep boxes: expected {case['ls_boxes']}, got {len(disc_ls)}"
+    assert (
+        dyada.discretization_to_2d_ascii(disc_ls) == case["ascii_ls"]
+    ), f"{label}: level_sweep ascii mismatch"
 
-    # Lossless: reconstructed scalings match original at the raster level
-    scalings = get_leaf_scalings(disc_ls, coeff_ls)
+    # Lossless: every stage's reconstruction must match the original raster.
     from wavelets_with_omnitrees import get_resampled_image
 
     target_level = disc.descriptor.get_maximum_level().astype(np.int64)
     raster_orig = get_resampled_image(disc, nodal, target_level)
-    raster_new = get_resampled_image(disc_ls, scalings, target_level)
-    np.testing.assert_array_equal(raster_orig, raster_new)
+    for stage_name, stage_disc, stage_coeff in (
+        ("canonical", disc_can, coeff_can),
+        ("downsplit", disc_pd, coeff_pd),
+        ("level_sweep", disc_ls, coeff_ls),
+    ):
+        scalings = get_leaf_scalings(stage_disc, stage_coeff)
+        raster_new = get_resampled_image(stage_disc, scalings, target_level)
+        np.testing.assert_array_equal(
+            raster_orig,
+            raster_new,
+            err_msg=f"{label}: {stage_name} reconstruction mismatch",
+        )
 
 
 def test_2d_downsplit_compresses():
