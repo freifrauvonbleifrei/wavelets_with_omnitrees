@@ -1,0 +1,25 @@
+  name: openvdb                                                                  
+  channels:
+    - conda-forge
+  dependencies:
+    - python=3.12
+    - openvdb=13.0                            
+    - numpy
+    - pytest                                  
+    - pip                                                                        
+    - pip:
+        - bitarray
+        - blosc2                              
+        - brotli
+        - icecream                            
+        - lz4                                                                    
+        - matplotlib
+        - py-spy
+        - tqdm
+        - zfpy                                
+        - zstd
+        - dyada[drawing,matplotlib]
+        - thingi10k
+        - trimesh
+        - embreex
+
