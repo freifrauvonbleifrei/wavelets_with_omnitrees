@@ -969,12 +969,26 @@ def compress_by_downsplit_coarsening(
             num_children = 1 << k
             children_indices = [coarsen_stack.pop() for _ in range(num_children)]
 
-            # Coarsen only when all direct children are leaves and the
-            # parent has a complete coefficient vector (normalization may
-            # leave newly created multi-dim nodes with placeholder [nan]).
-            if len(coefficients[coarsen_desc_i]) == (1 << k) and not any(
-                len(coefficients[c]) > 1 for c in children_indices
-            ):
+            # Sanity check: every node should have a coefficient vector
+            # whose length matches its ref count (1 for leaves, 2^k for k-dim
+            # interior nodes).
+            assert len(coefficients[coarsen_desc_i]) == (1 << k), (
+                f"node {coarsen_desc_i} ref={current_ref.to01()} k={k} "
+                f"expected len {1 << k}, got {len(coefficients[coarsen_desc_i])} "
+                f"({coefficients[coarsen_desc_i]})"
+            )
+            if __debug__:
+                for _ci in children_indices:
+                    _ck = discretization.descriptor[_ci].count()
+                    _expected = 1 if _ck == 0 else (1 << _ck)
+                    assert len(coefficients[_ci]) == _expected, (
+                        f"child {_ci} of {coarsen_desc_i}: ref="
+                        f"{discretization.descriptor[_ci].to01()} k={_ck} "
+                        f"expected len {_expected}, got {len(coefficients[_ci])} "
+                        f"({coefficients[_ci]})"
+                    )
+            # Coarsen only when all direct children are leaves.
+            if not any(len(coefficients[c]) > 1 for c in children_indices):
                 branch_level = node_levels[coarsen_desc_i].astype(np.int64)
                 # local_bound = threshold * 2^(+sum(per_dim_levels))
                 local_bound = coarsening_threshold * float(
