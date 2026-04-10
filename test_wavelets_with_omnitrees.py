@@ -167,33 +167,6 @@ ___
 |_|
 |_|""",
     },
-    # ── E: 2×4 horizontal stripes via two stacked A subtrees ──
-    # Same failure pattern, one level deeper: canonical coarsens the
-    # within-strip pairs (8→4) but the resulting tree is still the
-    # asymmetric layout that downsplit cannot simplify.
-    {
-        "label": "E_2x4_horizontal_stripes",
-        "descriptor": "10 01 01 00 00 01 00 00 01 01 00 00 01 00 00",
-        "values": [0, 0, 1, 1, 0, 0, 1, 1],
-        "init_boxes": 8,
-        "can_boxes": 4,
-        "pd_boxes": 4,
-        "ls_boxes": 2,
-        "ascii_init": """\
-_____
-|_|_|
-|_|_|
-|_|_|
-|_|_|""",
-        "ascii_pd": """\
-_____
-|_|_|
-|_|_|""",
-        "ascii_ls": """\
-___
-|_|
-|_|""",
-    },
     # ── Q: 4×4 horizontal stripes via `11` root + four asymmetric quadrants ──
     # Has a multi-dim root, so downsplit *does* try to cascade — but the four
     # sibling subtrees are individually asymmetric and downsplit cannot
@@ -237,6 +210,69 @@ _____
 |_|_|
 |_|_|
 |_|_|""",
+    },
+    # ── R: canonical input (4×4) — bot-left checker + 3 zero quadrants ──
+    # Downsplit cascades the root `11` but never produces this restructuring;
+    # level-sweep finds it (optimum)
+    {
+        "label": "R_canonical_quadrant_checker",
+        "descriptor": "11 11 00 00 00 00 00 00 00",
+        "values": [0, 1, 1, 0, 0, 0, 0],
+        "init_boxes": 7,
+        "can_boxes": 7,
+        "pd_boxes": 7,
+        "ls_boxes": 6,
+        "ascii_init": """\
+_________
+|   |   |
+|___|___|
+|_|_|   |
+|_|_|___|""",
+        "ascii_pd": """\
+_________
+|   |   |
+|___|___|
+|_|_|   |
+|_|_|___|""",
+        "ascii_ls": """\
+_________
+|   |   |
+|___|   |
+|_|_|   |
+|_|_|___|""",
+    },
+    # ── S: canonical input (4×4) — bot-left checker + bot-right `01` + top half ──
+    # Another already-canonical tree.  The two top-quadrant leaves (top-left
+    # and top-right, both value 0) form a full-width strip that could merge
+    # into a single 1×0.5 leaf, but downsplit's cascading at the root `11`
+    # never assembles this combination.  Level-sweep finds it (8→7).
+    #
+    {
+        "label": "S_canonical_top_half_merge",
+        "descriptor": "11 11 00 00 00 00 01 00 00 00 00",
+        "values": [0, 1, 1, 0, 1, 0, 0, 0],
+        "init_boxes": 8,
+        "can_boxes": 8,
+        "pd_boxes": 8,
+        "ls_boxes": 7,
+        "ascii_init": """\
+_________
+|   |   |
+|___|___|
+|_|_|___|
+|_|_|___|""",
+        "ascii_pd": """\
+_________
+|   |   |
+|___|___|
+|_|_|___|
+|_|_|___|""",
+        "ascii_ls": """\
+_________
+|       |
+|_______|
+|_|_|___|
+|_|_|___|""",
     },
     # ── M: original probe descriptor (no compression in the current pipeline) ──
     # The optimum here is 6 boxes (the merged top-right column collapses Q3.r
