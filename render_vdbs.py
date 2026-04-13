@@ -176,6 +176,80 @@ print(f"\nDone! {len(vdb_files)} renderings saved to {config['out_dir']}/")
 ''')
 
 
+def omnitree_to_vdb_file(
+    descriptor_file: str,
+    values_file: str,
+    out_dir: str,
+    out_name: str,
+    bbox_min=None,
+    per_dim_levels=None,
+    grid_name: str = "density",
+    background: float = 0.0,
+) -> str:
+    """Reconstruct a VDB from a saved omnitree descriptor + leaf values.
+
+    *descriptor_file* is the `_<dim>d.bin` file written by
+    `RefinementDescriptor.to_file`; *values_file* is the matching `.npy`
+    of leaf scalings.  Writes `<out_dir>/<out_name>.vdb` and returns its path.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import numpy as np
+    import openvdb as vdb
+    import dyada.descriptor
+    import dyada.discretization
+    import dyada.linearization
+    from compare_cloud import omnitree_to_vdb
+
+    descriptor = dyada.descriptor.RefinementDescriptor.from_file(descriptor_file)
+    discretization = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(), descriptor
+    )
+    leaf_values = np.load(values_file)
+
+    if per_dim_levels is None:
+        per_dim_levels = np.asarray(descriptor.get_maximum_level())
+    else:
+        per_dim_levels = np.asarray(per_dim_levels)
+    if bbox_min is None:
+        bbox_min = np.zeros(descriptor.get_num_dimensions(), dtype=np.int64)
+    else:
+        bbox_min = np.asarray(bbox_min)
+
+    grid = omnitree_to_vdb(
+        discretization, leaf_values, per_dim_levels, bbox_min,
+        grid_name=grid_name, background=background,
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, out_name + ".vdb")
+    vdb.write(out_path, grids=[grid])
+    print(f"  Reconstructed omnitree -> {out_path} "
+          f"({len(descriptor)} nodes, {len(leaf_values)} leaves, "
+          f"levels={per_dim_levels.tolist()})")
+    return out_path
+
+
+def _resolve_input(path: str) -> str:
+    """If *path* is an omnitree descriptor `.bin`, reconstruct to a VDB beside it.
+
+    Otherwise return *path* unchanged.  The matching values file is found by
+    replacing the `_<dim>d.bin` suffix with `_values.npy`.  The resulting VDB
+    is written next to the `.bin` with the same stem.
+    """
+    import re
+    m = re.search(r"_(\d+)d\.bin$", path)
+    if not m:
+        return path
+    values_path = path[: m.start()] + "_values.npy"
+    if not os.path.exists(values_path):
+        raise FileNotFoundError(
+            f"Expected leaf-values file beside descriptor: {values_path}"
+        )
+    out_dir = os.path.dirname(path)
+    out_name = os.path.splitext(os.path.basename(path))[0]
+    return omnitree_to_vdb_file(path, values_path, out_dir, out_name)
+
+
 def _ensure_float_vdb(vdb_path: str, tmp_dir: str) -> str:
     """If a VDB contains only BoolGrids, convert to FloatGrid (density=1.0).
 
@@ -222,9 +296,11 @@ def main():
     parser.add_argument("--output-dir", type=str, default="./vdb_renders")
     args = parser.parse_args()
 
-    # Convert BoolGrid VDBs to FloatGrid for Blender compatibility
+    # Resolve inputs: reconstruct omnitree _<dim>d.bin files into temp VDBs,
+    # and convert BoolGrid VDBs to FloatGrid for Blender compatibility.
     tmp_dir = "/tmp/render_vdbs_converted"
-    vdb_files = [_ensure_float_vdb(str(Path(f).resolve()), tmp_dir) for f in args.files]
+    resolved = [_resolve_input(str(Path(f).resolve())) for f in args.files]
+    vdb_files = [_ensure_float_vdb(p, tmp_dir) for p in resolved]
     print(f"Will render {len(vdb_files)} VDB files:")
     for f in vdb_files:
         print(f"  {f}")
