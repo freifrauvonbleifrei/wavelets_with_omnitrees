@@ -53,8 +53,29 @@ def partition_paths(work_dir, part_idx):
     )
 
 
+_WORKER_GRID = None  # per-process cache of the VDB grid (set by _init_worker)
+
+
+def _init_worker(vdb_path, grid_name):
+    """Pool initializer: load the VDB once per worker process and cache it."""
+    global _WORKER_GRID
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from dyada_cache_patch import install
+        install()
+    except ImportError:
+        pass
+    from compare_cloud import read_vdb_grid
+    _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
+
+
 def compress_partition(args_tuple):
-    """Compress a single sub-region of the VDB grid.  Runs in a worker process."""
+    """Compress a single sub-region of the VDB grid.  Runs in a worker process.
+
+    Reuses the per-worker VDB grid loaded by _init_worker to avoid re-reading
+    the (potentially multi-GB) VDB file on every task.
+    """
     (part_idx, vdb_path, grid_name, sub_bbox_min, sub_levels,
      threshold, work_dir) = args_tuple
 
@@ -74,7 +95,12 @@ def compress_partition(args_tuple):
     )
     import numpy as np
 
-    grid = read_vdb_grid(vdb_path, grid_name)
+    global _WORKER_GRID
+    if _WORKER_GRID is None:
+        # Happens when compress_partition is called directly (e.g. serial run)
+        # without the pool initializer.
+        _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
+    grid = _WORKER_GRID
     disc, vals = omnitree_from_vdb(grid, np.array(sub_bbox_min), np.array(sub_levels))
 
     n_initial = len(disc.descriptor)
@@ -135,8 +161,10 @@ def main():
     parser.add_argument("--max-level", type=int, default=6)
     parser.add_argument("--skip-serial", action="store_true",
                         help="Skip the serial baseline (faster for testing)")
-    parser.add_argument("--split-levels", type=int, default=None,
-                        help="Top-level splits per dim (creates 8^split_levels partitions). "
+    parser.add_argument("--split-levels", type=int, nargs="+", default=None,
+                        help="Top-level splits per dim.  Pass a single int to apply "
+                        "the same level to all dims (e.g. 3 -> 8^3=512 partitions), "
+                        "or one int per dim (e.g. 3 3 4 -> 8x8x16=1024 partitions). "
                         "Default: auto (~4-8x more partitions than workers).")
     parser.add_argument("--work-dir", type=str, default="/tmp/parallel_cloud",
                         help="Directory for per-partition cache files (resumable).")
@@ -151,24 +179,31 @@ def main():
 
     # ── Determine partition layout ─────────────────────────────────────────
     # Aim for ~8x more partitions than workers, so unbalanced load averages out.
-    # Each split_levels=N gives 8^N partitions (in 3D).
+    num_dims = len(per_dim_levels)
     if args.split_levels is None:
         target_partitions = max(args.workers * 8, 8)
-        split_levels = max(1, int(np.ceil(np.log2(target_partitions) / 3)))
+        s = max(1, int(np.ceil(np.log2(target_partitions) / num_dims)))
+        grid_levels = [s] * num_dims
+    elif len(args.split_levels) == 1:
+        grid_levels = [args.split_levels[0]] * num_dims
+    elif len(args.split_levels) == num_dims:
+        grid_levels = list(args.split_levels)
     else:
-        split_levels = args.split_levels
-    # Cap so each sub-region keeps at least 3 levels of refinement
-    max_split = max(1, int(min(per_dim_levels)) - 3)
-    if split_levels > max_split:
-        print(f"  Capping split_levels {split_levels} -> {max_split} "
-              f"(min per-dim level is {int(min(per_dim_levels))})")
-        split_levels = max_split
-    grid_levels = [split_levels] * 3
+        parser.error(
+            f"--split-levels takes 1 or {num_dims} values, got {len(args.split_levels)}"
+        )
+    # Cap each dim so its sub-region keeps at least 3 levels of refinement
+    for d in range(num_dims):
+        max_split_d = max(1, int(per_dim_levels[d]) - 3)
+        if grid_levels[d] > max_split_d:
+            print(f"  Capping split_levels[{d}] {grid_levels[d]} -> {max_split_d} "
+                  f"(per-dim level {d} is {int(per_dim_levels[d])})")
+            grid_levels[d] = max_split_d
     grid_shape = tuple(1 << lv for lv in grid_levels)
     n_partitions = 1
     for s in grid_shape:
         n_partitions *= s
-    sub_levels = per_dim_levels - split_levels
+    sub_levels = per_dim_levels - np.array(grid_levels)
 
     # Compute sub-region origins (Fortran-order flat index → grid coord → bbox offset)
     full_grid_shape = np.array([1 << int(l) for l in per_dim_levels])
@@ -200,7 +235,7 @@ def main():
             pending.append(a)
 
     print(f"\nPartitioned into {n_partitions} sub-regions "
-          f"(split_levels={split_levels}, grid={grid_shape}, sub_levels={sub_levels})")
+          f"(split_levels={grid_levels}, grid={grid_shape}, sub_levels={sub_levels})")
     print(f"Resume cache in {work_dir}/: {len(cached)} cached, {len(pending)} pending")
     del grid
 
@@ -229,32 +264,37 @@ def main():
           f"{len(pending)} pending, {len(cached)} cached) ===")
     t_parallel_start = time.perf_counter()
 
-    child_descriptors = [None] * n_partitions
-    child_values = [None] * n_partitions
+    # Don't hold partition data in the main process during the parallel phase —
+    # workers write to disk anyway.  Just track stats; load from disk only when
+    # compose_grid actually needs them.  This keeps main-process RAM bounded
+    # even for hundreds of fine-threshold partitions.
     child_stats = [None] * n_partitions
 
     if pending:
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        with ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=_init_worker,
+            initargs=(vdb_path, args.grid_name),
+        ) as pool:
             futures = {pool.submit(compress_partition, a): a[0] for a in pending}
             for future in as_completed(futures):
                 part_idx, stats = future.result()
-                desc, vals, _ = load_partition(work_dir, part_idx)
-                child_descriptors[part_idx] = desc
-                child_values[part_idx] = vals
                 child_stats[part_idx] = stats
                 print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes, "
                       f"{stats['compressed_boxes']:7d} boxes "
                       f"(from {stats['initial_nodes']})")
 
-    # Load cached partitions
-    for part_idx in cached:
+    # Load all partitions (cached + freshly computed) from disk for compose.
+    child_descriptors = [None] * n_partitions
+    child_values = [None] * n_partitions
+    for part_idx in range(n_partitions):
         desc, vals, stats = load_partition(work_dir, part_idx)
         child_descriptors[part_idx] = desc
         child_values[part_idx] = vals
-        child_stats[part_idx] = stats
+        if child_stats[part_idx] is None:
+            child_stats[part_idx] = stats
 
-    if cached:
-        print(f"  Loaded {len(cached)} cached partitions from {work_dir}/")
+    print(f"  Loaded {n_partitions} partitions from {work_dir}/ for compose")
 
     t_workers = time.perf_counter() - t_parallel_start
 
