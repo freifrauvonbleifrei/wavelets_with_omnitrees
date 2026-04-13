@@ -396,11 +396,14 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         if not vdb_file.exists():
             _write_inside_bool_vdb(disc_init, init_leaf_vals, level, str(vdb_file))
         if need_openvdb:
-            openvdb_stats = openvdb_topology_bits(str(vdb_file))
-            results["openvdb"] = (
-                openvdb_stats["inside"]["total_topology_bits"],
-                openvdb_stats["inside"]["dense_value_bytes"],
-            )
+            try:
+                openvdb_stats = openvdb_topology_bits(str(vdb_file))
+                results["openvdb"] = (
+                    openvdb_stats["inside"]["total_topology_bits"],
+                    openvdb_stats["inside"]["dense_value_bytes"],
+                )
+            except RuntimeError as e:
+                results["openvdb"] = (-1,-1)
         loaded_vdb_grid = read_vdb_grid(str(vdb_file), "inside")
 
     if need_canonical:
