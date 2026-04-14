@@ -234,8 +234,12 @@ def reconstruct_and_check(full_disc, disc, coeff, reference_binary):
     """Recover scalings, reconstruct binary grid, return (desc, boxes, exact)."""
     scaling = get_leaf_scalings(disc, coeff).astype(np.float32)
     recon = binary_values_on_full_grid(full_disc, disc, scaling)
-    exact = bool(np.array_equal(recon, reference_binary))
-    assert exact
+    if not np.array_equal(recon, reference_binary):
+        diff_idx = np.flatnonzero(recon != reference_binary)
+        raise RuntimeError(
+            f"reconstruction mismatch: {len(diff_idx)} / {recon.size} voxels differ "
+            f"(first few morton indices: {diff_idx[:8].tolist()})"
+        )
     return len(disc.descriptor), len(disc), recon
 
 
@@ -365,7 +369,21 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
 
     def _ensure_reference_binary():
         nonlocal reference_binary
-        if reference_binary is None:
+        if reference_binary is not None:
+            return
+        if HAS_OPENVDB and (loaded_vdb_grid is not None or vdb_file.exists()):
+            grid = loaded_vdb_grid if loaded_vdb_grid is not None \
+                else read_vdb_grid(str(vdb_file), "inside")
+            ref_disc, ref_vals = omnitree_from_vdb(
+                grid,
+                np.array([0, 0, 0], dtype=np.int64),
+                np.array([level] * dimensionality),
+            )
+            reference_binary = binary_values_on_full_grid(
+                full_discretization, ref_disc,
+                ref_vals.astype(np.float32) >= 0.5,
+            )
+        else:
             full_occupancy = midpoint_occupancy_coefficients(inside_fn, level)
             reference_binary = full_occupancy >= 0.5
 
