@@ -847,6 +847,10 @@ def compress_by_downsplit_coarsening(
             planned_downsplits.append((desc_index, dims_ba))
 
         if planned_downsplits:
+            # Snapshot the pre-downsplit state so we can roll back if the
+            # downsplit ends up producing no coarsening opportunities.
+            pre_ds_disc = discretization
+            pre_ds_coeffs = coefficients
             old_disc = discretization
             discretization, pd_mapping = apply_planned_downsplits(
                 discretization,
@@ -968,6 +972,12 @@ def compress_by_downsplit_coarsening(
             num_dimensions,
         )
         total_discarded_l1 += round_discarded
+
+        # ── Rollback uncoarsened downsplits ──────────────────────────────
+        if (_depth_iter is None and planned_downsplits and not planned_any):
+            discretization = pre_ds_disc
+            coefficients = pre_ds_coeffs
+            break
 
         # ── Normalization round ──────────────────────────────────────────
         # After downsplit + coarsening the tree may contain uniqueness
