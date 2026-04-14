@@ -249,7 +249,6 @@ def output_files_for(thingy_id: int, level: int, output_dir: Path) -> list[Path]
     files = [
         output_dir / f"{prefix}_canonical_3d.bin",
         output_dir / f"{prefix}_downsplit_3d.bin",
-#        output_dir / f"{prefix}_level_sweep_3d.bin",
     ]
     if HAS_OPENVDB:
         files.append(output_dir / f"{prefix}_openvdb.vdb")
@@ -337,12 +336,10 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
 
     canonical_file = output_dir / f"{prefix}_canonical_3d.bin"
     downsplit_file = output_dir / f"{prefix}_downsplit_3d.bin"
-#    level_sweep_file = output_dir / f"{prefix}_level_sweep_3d.bin"
     vdb_file = output_dir / f"{prefix}_openvdb.vdb"
 
     need_canonical = not canonical_file.exists()
     need_downsplit = not downsplit_file.exists()
-#    need_level_sweep = not level_sweep_file.exists()
     need_openvdb = HAS_OPENVDB and not vdb_file.exists()
 
     if not (need_canonical or need_downsplit or need_openvdb):
@@ -394,7 +391,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     disc_init = init_leaf_vals = None
     loaded_vdb_grid = None
     needs_any_vdb = HAS_OPENVDB and (
-        need_openvdb or need_canonical or need_downsplit or need_level_sweep
+        need_openvdb or need_canonical or need_downsplit
     )
 
     if needs_any_vdb:
@@ -445,12 +442,6 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
                 [list(c) for c in coefficients],
                 coarsening_threshold=0.0,
             )
-    elif need_downsplit or need_level_sweep:
-        disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
-            full_discretization,
-            [list(c) for c in coefficients],
-            coarsening_threshold=0.0,
-        )
     elif need_downsplit: # or need_level_sweep:
         # Canonical exists — load and reconstruct coefficients
         disc_can = _load_discretization(canonical_file)
@@ -479,11 +470,6 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             [list(c) for c in coeff_can],
             coarsening_threshold=0.0,
         )
-    #elif need_level_sweep:
-    #    # Pushdown exists — load and reconstruct coefficients
-    #    disc_pd = _load_discretization(downsplit_file)
-    #    leaf_values = _sample_at_finest_midpoints(disc_pd, inside_fn, level)
-    #    coeff_pd = _hierarchize_on_tree(disc_pd, leaf_values)
 
     if need_downsplit:
         _ensure_reference_binary()
@@ -494,20 +480,6 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         reconstructions["downsplit"] = recon
         descriptors["downsplit"] = disc_pd.descriptor
 
-    # ── level sweep ──────────────────────────────────────────────────────────
-    #if need_level_sweep:
-    #    disc_ls, coeff_ls, _ = compress_by_level_sweep_coarsening(
-    #        disc_pd,
-    #        [list(c) for c in coeff_pd],
-    #        coarsening_threshold=0.0,
-    #    )
-    #    _ensure_reference_binary()
-    #    nd, nb, recon = reconstruct_and_check(
-    #        full_discretization, disc_ls, coeff_ls, reference_binary
-    #    )
-    #    results["level_sweep"] = (nd * dimensionality, nb)
-    #    reconstructions["level_sweep"] = recon
-    #    descriptors["level_sweep"] = disc_ls.descriptor
 
     # ── Print ────────────────────────────────────────────────────────────────
     if results:
@@ -518,13 +490,6 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         print(f"  {'-' * 52}")
         for label, (nt, nb) in results.items():
             print(f"  {label:<18s} {nt:10d} {nb:11d} {nt + nb:11d}")
-
-    # ── Assertions ───────────────────────────────────────────────────────────
-    for label, recon in reconstructions.items():
-        assert np.array_equal(recon, reference_binary), (
-            f"thingy {thingy_id} level={level} {label}: "
-            f"reconstruction does not match reference"
-        )
 
     labels = list(reconstructions.keys())
     for i in range(len(labels)):
