@@ -480,24 +480,6 @@ def compress_by_omnitree_coarsening(
     """
     num_dimensions = discretization.descriptor.get_num_dimensions()
 
-    def apply_single_phase_round(
-        current_discretization: dyada.discretization.Discretization,
-        current_coefficients: list[Sequence[float]],
-        phase_threshold: float,
-    ) -> tuple[
-        dyada.discretization.Discretization,
-        list[Sequence[float]],
-        bool,
-        float,
-    ]:
-        return _coarsening_round(
-            current_discretization,
-            current_coefficients,
-            phase_threshold,
-            num_dimensions,
-            allow_partial=True,
-        )
-
     def run_phase(
         phase_discretization: dyada.discretization.Discretization,
         phase_coefficients: list[Sequence[float]],
@@ -510,10 +492,12 @@ def compress_by_omnitree_coarsening(
                 phase_coefficients,
                 changed,
                 round_discarded,
-            ) = apply_single_phase_round(
+            ) = _coarsening_round(
                 phase_discretization,
                 phase_coefficients,
-                phase_threshold=phase_threshold,
+                phase_threshold,
+                num_dimensions,
+                allow_partial=True,
             )
             phase_discarded += round_discarded
             if not changed:
