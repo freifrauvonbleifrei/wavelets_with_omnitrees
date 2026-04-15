@@ -368,7 +368,7 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
         nonlocal reference_binary
         if reference_binary is not None:
             return
-        if HAS_OPENVDB and (loaded_vdb_grid is not None or vdb_file.exists()):
+        if HAS_OPENVDB:
             grid = loaded_vdb_grid if loaded_vdb_grid is not None \
                 else read_vdb_grid(str(vdb_file), "inside")
             ref_disc, ref_vals = omnitree_from_vdb(
@@ -395,21 +395,22 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
     )
 
     if needs_any_vdb:
-        # Mirroring compare_cloud's flow: stream inside_fn into a FloatGrid
-        # slice-by-slice (no dims^3 dense array), then build the adaptive
-        # octree via omnitree_from_vdb. The same omnitree feeds both the
-        # OpenVDB output (a sparse BoolGrid via fill_omnitree_into_vdb) and
-        # the canonical/downsplit/level_sweep pipeline below.
-        if need_canonical or not vdb_file.exists():
+        # If the VDB file doesn't exist, sample inside_fn into a FloatGrid
+        # slice-by-slice and write the adaptive BoolGrid.  Either way, the
+        # canonical/downsplit pipeline and the reference binary are built
+        # from the VDB on disk — never from a fresh inside_fn sample — so the
+        # two are guaranteed to be consistent, even if inside_fn (e.g. trimesh
+        # ray-cast containment) is nondeterministic on boundary points.
+        if not vdb_file.exists():
             float_grid = stream_inside_fn_to_float_vdb(inside_fn, level)
-            disc_init, init_leaf_vals = omnitree_from_vdb(
+            tmp_disc, tmp_vals = omnitree_from_vdb(
                 float_grid,
                 np.array([0, 0, 0], dtype=np.int64),
                 np.array([level] * dimensionality),
             )
             del float_grid
-        if not vdb_file.exists():
-            _write_inside_bool_vdb(disc_init, init_leaf_vals, level, str(vdb_file))
+            _write_inside_bool_vdb(tmp_disc, tmp_vals, level, str(vdb_file))
+            del tmp_disc, tmp_vals
         if need_openvdb:
             try:
                 openvdb_stats = openvdb_topology_bits(str(vdb_file))
@@ -420,6 +421,12 @@ def run_one(thingy_id: int, inside_fn, level: int, output_dir: Path):
             except RuntimeError as e:
                 results["openvdb"] = (-1,-1)
         loaded_vdb_grid = read_vdb_grid(str(vdb_file), "inside")
+        if need_canonical or need_downsplit:
+            disc_init, init_leaf_vals = omnitree_from_vdb(
+                loaded_vdb_grid,
+                np.array([0, 0, 0], dtype=np.int64),
+                np.array([level] * dimensionality),
+            )
 
     if need_canonical:
         if HAS_OPENVDB:
