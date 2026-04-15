@@ -91,16 +91,26 @@ def create_volume_material():
     return mat
 
 
-def fit_camera(vol_obj):
-    """Fit camera to the volume's bounding box."""
+def fit_camera(vol_obj, bbox=None):
+    """Fit camera to the volume's bounding box.
+
+    If *bbox* is given as ((min_x,min_y,min_z),(max_x,max_y,max_z)) it is
+    used directly (e.g. computed from the source VDB index space, which
+    is what Cycles actually renders even when vol.dimensions reports a
+    transformed extent).
+    """
     scene = bpy.context.scene
     cam = scene.camera
 
-    bb = [mathutils.Vector(c) for c in vol_obj.bound_box]
-    bb_min = mathutils.Vector(min(v[i] for v in bb) for i in range(3))
-    bb_max = mathutils.Vector(max(v[i] for v in bb) for i in range(3))
+    if bbox is not None:
+        bb_min = mathutils.Vector(bbox[0])
+        bb_max = mathutils.Vector(bbox[1])
+    else:
+        bb = [mathutils.Vector(c) for c in vol_obj.bound_box]
+        bb_min = mathutils.Vector(min(v[i] for v in bb) for i in range(3))
+        bb_max = mathutils.Vector(max(v[i] for v in bb) for i in range(3))
     center = (bb_min + bb_max) / 2
-    max_dim = max(vol_obj.dimensions)
+    max_dim = max(bb_max - bb_min)
 
     # Place camera so the volume fills ~60% of the frame
     # Use sensor geometry to compute exact distance for any resolution
@@ -272,12 +282,7 @@ def _ensure_float_vdb(vdb_path: str, tmp_dir: str) -> str:
         fg.name = "density"
         fg.transform = g.transform
         for item in g.iterOnValues():
-            ijk = item.min
-            if hasattr(item, "count") and item.count > 1:
-                mx = tuple(ijk[d] + item.count - 1 for d in range(3))
-                fg.fill(ijk, mx, 1.0)
-            else:
-                fg.getAccessor().setValueOn(ijk, 1.0)
+            fg.fill(item.min, item.max, 1.0)
         float_grids.append(fg)
 
     os.makedirs(tmp_dir, exist_ok=True)
