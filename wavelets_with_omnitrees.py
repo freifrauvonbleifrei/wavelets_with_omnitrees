@@ -105,7 +105,7 @@ def transform_to_all_wavelet_coefficients(
         if refinement == discretization.descriptor.d_zeros:
             coefficient = next(backwards_nodal_coefficients)
             # ic(coefficient)
-            coefficients[descriptor_index] = [coefficient]
+            coefficients[descriptor_index] = np.array([coefficient], dtype=np.float64)
             computed_scaling_coefficients.append(coefficient)
         else:
             num_refinements = refinement.count()
@@ -419,9 +419,9 @@ def _coarsening_round(
     if __debug__:
         dyada.descriptor.validate_descriptor(discretization.descriptor)
 
-    new_coefficients: list[Sequence[float]] = [
-        [np.nan] for _ in range(len(discretization.descriptor))
-    ]
+    new_coefficients: list[Optional[np.ndarray]] = [None] * len(
+        discretization.descriptor
+    )
     inverted_mapping: dict[int, set[int]] = {}
     for old_index, mapped_to in enumerate(mapping):
         for new_index in mapped_to:
@@ -437,7 +437,9 @@ def _coarsening_round(
             if len(coefficients[oi]) == expected_len
         ]
         first_found = matching[0] if matching else mapped_from_sorted[0]
-        new_coefficients[new_index] = list(coefficients[first_found])
+        new_coefficients[new_index] = np.asarray(
+            coefficients[first_found], dtype=np.float64
+        ).copy()
         if first_found not in final_markers:
             continue
         marker = final_markers[first_found]
@@ -455,14 +457,20 @@ def _coarsening_round(
             delete_indices.update(
                 get_numbers_with_ith_bit_set(local_bit_index, num_ref)
             )
-        new_coefficients[new_index] = list(
-            np.delete(arr=coefficients[first_found], obj=sorted(delete_indices))
+        new_coefficients[new_index] = np.delete(
+            np.asarray(coefficients[first_found], dtype=np.float64),
+            sorted(delete_indices),
         )
         if __debug__ and len(new_coefficients[new_index]) != expected_len:
             raise ValueError(
                 f"Coefficient length mismatch at new index {new_index}: "
                 f"got {len(new_coefficients[new_index])}, expected {expected_len}"
             )
+
+    # Backfill any new index that no old index mapped into.
+    for i in range(len(new_coefficients)):
+        if new_coefficients[i] is None:
+            new_coefficients[i] = np.array([np.nan], dtype=np.float64)
 
     return discretization, new_coefficients, True, round_discarded_l1
 
@@ -536,16 +544,17 @@ def downsplit_single_node_coefficients(
     old_coeffs: Sequence[float],
     old_ref: ba.bitarray,
     down_dim: int,
-) -> tuple[list[float], list[list[float]]]:
+) -> tuple[np.ndarray, list[np.ndarray]]:
     """Compute coefficient arrays for the new parent and intermediates after a downsplit.
 
     Splits the k-dim Haar coefficient vector using the tensor structure:
       C[k_rem, k_d] = old_coeffs[j]   where j encodes (k_rem, k_d) via bit d_local.
 
     Returns:
-        new_parent_coeffs  : (k-1)-dim coefficient list (the k_d=0 slice of C).
-        intermediate_coeffs: list of 2^(k-1) pairs [scaling, detail_d], one per
-                             new intermediate child in remaining-dim Morton order.
+        new_parent_coeffs  : (k-1)-dim coefficient array (the k_d=0 slice of C).
+        intermediate_coeffs: list of 2^(k-1) length-2 arrays [scaling, detail_d],
+                             one per new intermediate child in remaining-dim
+                             Morton order.
     """
     k = old_ref.count()
     assert k >= 2
@@ -564,12 +573,13 @@ def downsplit_single_node_coefficients(
         k_rem = bitarray.util.ba2int(rem_bits) if n_rem > 0 else 0
         C[k_rem, k_d] = old_coeffs[j]
 
-    new_parent_coeffs = list(C[:, 0])
+    new_parent_coeffs = C[:, 0].copy()
     # Apply the inverse remaining-dim Haar to both columns to get per-intermediate values.
     scalings = dehierarchize(C[:, 0], n_rem)
     details = dehierarchize(C[:, 1], n_rem)
     intermediate_coeffs = [
-        [float(scalings[r]), float(details[r])] for r in range(n_rem_slots)
+        np.array([scalings[r], details[r]], dtype=np.float64)
+        for r in range(n_rem_slots)
     ]
     return new_parent_coeffs, intermediate_coeffs
 
@@ -597,7 +607,7 @@ def reverse_downsplit_coefficients(
     children_coeffs: list[Sequence[float]],
     children_refs: ba.bitarray | list[ba.bitarray],
     absorbed_dims: ba.bitarray,
-) -> tuple[list[float], list[list[list[float]]]]:
+) -> tuple[np.ndarray, list[list[np.ndarray]]]:
     """Wavelet-space normalization: absorb dims from children into parent.
 
     Given parent with ref R_p and 2^|R_p| children, where absorbed_dims D is
@@ -630,7 +640,7 @@ def reverse_downsplit_coefficients(
     absorbed_dims_list = get_refined_dimensions_desc(absorbed_dims)
 
     # ── Merged parent coefficients ──────────────────────────────────────────
-    merged_coeffs = [np.nan] * (1 << k_merged)
+    merged_coeffs = np.full(1 << k_merged, np.nan, dtype=np.float64)
     parent_dims_list = get_refined_dimensions_desc(parent_ref)
 
     for t2_int in range(n_absorbed_slots):
@@ -679,7 +689,7 @@ def reverse_downsplit_coefficients(
     # inverse Haar per remaining-dim fiber (per child's own ref).
     nod_matrix = nodalization_matrix(k_absorbed)  # 2^|D| × 2^|D|
 
-    split_children: list[list[list[float]]] = []
+    split_children: list[list[np.ndarray]] = []
     for j in range(n_parent_children):
         child_c = children_coeffs[j]
         child_ref_j = per_child_ref[j]
@@ -720,11 +730,9 @@ def reverse_downsplit_coefficients(
         # Apply inverse Haar in D-dims
         sub_values = np.matmul(nod_matrix, tensor, dtype=np.float64)
 
-        sub_children_for_j: list[list[float]] = []
+        sub_children_for_j: list[np.ndarray] = []
         for d_int in range(n_absorbed_slots):
-            sub_coeffs = [np.nan] * n_remaining_slots
-            for tr_int in range(n_remaining_slots):
-                sub_coeffs[tr_int] = float(sub_values[d_int, tr_int])
+            sub_coeffs = sub_values[d_int].astype(np.float64, copy=True)
             # Restore NaN at scaling slot
             sub_coeffs[0] = np.nan
             sub_children_for_j.append(sub_coeffs)
@@ -740,7 +748,7 @@ def _merged_node_coefficients(
     intermediate_detail: float,
     down_dim: int,
     merged_ref: ba.bitarray,
-) -> list[float]:
+) -> np.ndarray:
     """Compute wavelet coefficients for a merged non-leaf intermediate.
 
     When two non-leaf siblings (childA at down_dim=0, childB at down_dim=1)
@@ -758,7 +766,7 @@ def _merged_node_coefficients(
     merged_dims = get_refined_dimensions_desc(merged_ref)
     d_local_merged = get_local_bit_index(down_dim, merged_dims)
 
-    merged_coeffs = [np.nan] * (1 << k_merged)
+    merged_coeffs = np.full(1 << k_merged, np.nan, dtype=np.float64)
     for j in range(1 << k_merged):
         j_bits = bitarray.util.int2ba(j, length=k_merged)
         j_push = int(j_bits[d_local_merged])
@@ -895,9 +903,9 @@ def compress_by_downsplit_coarsening(
                         pairs[rem_pos] = (a, child_idx)
                 old_child_pairs[old_i] = pairs
 
-            new_coefficients: list = [
-                [np.nan] for _ in range(len(discretization.descriptor))
-            ]
+            new_coefficients: list[Optional[np.ndarray]] = [None] * len(
+                discretization.descriptor
+            )
             # Track new indices that receive computed merged-node coefficients,
             # so we don't overwrite them when copying non-split old nodes.
             merged_new_indices: set[int] = set()
@@ -932,7 +940,7 @@ def compress_by_downsplit_coarsening(
                     if k_child <= 1:
                         # Regular (non-merged) intermediate or leaf: use downsplit result.
                         # Restore NaN convention for the scaling slot (index 0).
-                        ic = list(interm_coeffs[r])
+                        ic = interm_coeffs[r].copy()
                         ic[0] = np.nan
                         new_coefficients[child_start] = ic
                         merged_new_indices.add(child_start)
@@ -961,6 +969,11 @@ def compress_by_downsplit_coarsening(
                 new_i = next(iter(new_i_set))
                 if new_i not in merged_new_indices:
                     new_coefficients[new_i] = coefficients[old_i]
+
+            # Backfill any slots that neither pass touched.
+            for i in range(len(new_coefficients)):
+                if new_coefficients[i] is None:
+                    new_coefficients[i] = np.array([np.nan], dtype=np.float64)
 
             coefficients = new_coefficients
 
@@ -1079,10 +1092,12 @@ def compress_by_downsplit_coarsening(
                 violation_involved.add(phi)
                 violation_involved.update(children_hi)
 
-            # Place coefficients at new positions.
-            new_coefficients: list = [
-                [np.nan] for _ in range(len(discretization.descriptor))
-            ]
+            # Place coefficients at new positions.  Start with None and
+            # backfill unset slots with the leaf [nan] placeholder after the
+            # three passes, so we don't allocate a million throwaway arrays.
+            new_coefficients: list[Optional[np.ndarray]] = [None] * len(
+                discretization.descriptor
+            )
             assigned: set[int] = set()
 
             # Pass 1: merged parents.
@@ -1094,7 +1109,7 @@ def compress_by_downsplit_coarsening(
                 for ni in norm_mapping[parent_hi]:
                     new_ref = ba.bitarray(discretization.descriptor[ni])
                     if new_ref == merged_ref:
-                        new_coefficients[ni] = list(merged_coeffs)
+                        new_coefficients[ni] = np.asarray(merged_coeffs, dtype=np.float64).copy()
                         assigned.add(ni)
 
             # Pass 2: split children → sub-child coefficient arrays.
@@ -1145,7 +1160,7 @@ def compress_by_downsplit_coarsening(
                             if len(new_bits) > len(old_bits):
                                 d_position[local_i] = new_bits[-1]
                         d_int = bitarray.util.ba2int(d_position)
-                        new_coefficients[ni] = list(sub_list[d_int])
+                        new_coefficients[ni] = np.asarray(sub_list[d_int], dtype=np.float64).copy()
                         assigned.add(ni)
 
             # Pass 3: uninvolved nodes (1:1 copy from old).
@@ -1162,8 +1177,15 @@ def compress_by_downsplit_coarsening(
                 new_len = 1 if new_ref.count() == 0 else (1 << new_ref.count())
                 for oi in uninvolved_sources:
                     if len(coefficients[oi]) == new_len:
-                        new_coefficients[ni] = list(coefficients[oi])
+                        new_coefficients[ni] = np.asarray(
+                            coefficients[oi], dtype=np.float64
+                        ).copy()
                         break
+
+            # Backfill any slots that none of the three passes reached.
+            for i in range(len(new_coefficients)):
+                if new_coefficients[i] is None:
+                    new_coefficients[i] = np.array([np.nan], dtype=np.float64)
 
             coefficients = new_coefficients
 
@@ -1208,7 +1230,7 @@ def compress_by_level_sweep_coarsening(
         # Downsplit at each remaining multi-dim depth (max down to lowest)
         discretization, coefficients, d1 = compress_by_downsplit_coarsening(
             discretization,
-            [list(c) for c in coefficients],
+            [np.asarray(c, dtype=np.float64).copy() for c in coefficients],
             coarsening_threshold,
             _depth_schedule=multi_dim_depths,
         )
@@ -1216,7 +1238,7 @@ def compress_by_level_sweep_coarsening(
         # Re-converge with default downsplit to exploit any new opportunities
         discretization, coefficients, d2 = compress_by_downsplit_coarsening(
             discretization,
-            [list(c) for c in coefficients],
+            [np.asarray(c, dtype=np.float64).copy() for c in coefficients],
             coarsening_threshold,
         )
         total_discarded += d2
