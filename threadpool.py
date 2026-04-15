@@ -9,22 +9,34 @@ from multiprocessing.pool import ThreadPool
 
 from icecream import ic
 
-SCRIPT = os.path.join(os.path.dirname(__file__), "compare_openvdb_vs_wavelet_omnitrees.py")
+SCRIPT = os.path.join(
+    os.path.dirname(__file__), "compare_openvdb_vs_wavelet_omnitrees.py"
+)
 SLICES_PER_WORKER = 32
 
 
 def run_slice(slice_string: str, level: int, output_dir: str):
     ic(slice_string)
     cmd = [
-        sys.executable, "-O", SCRIPT,
-        "--thingy", "thingi10k",
-        "--slice", slice_string,
-        "--level", str(level),
-        "--output-dir", output_dir,
+        sys.executable,
+        "-O",
+        SCRIPT,
+        "--thingy",
+        "thingi10k",
+        "--slice",
+        slice_string,
+        "--level",
+        str(level),
+        "--output-dir",
+        output_dir,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
-        print(f"slice {slice_string} FAILED:\n{proc.stderr}", flush=True)
+        print(
+            f"slice {slice_string} l={level} FAILED (rc={proc.returncode}):\n"
+            f"{proc.stderr[-500:]}",
+            flush=True,
+        )
     else:
         print(proc.stdout, end="", flush=True)
     return proc.returncode
@@ -36,7 +48,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--max-level", type=int, default=8)
     parser.add_argument(
-        "--num-slices", type=int, default=None,
+        "--num-slices",
+        type=int,
+        default=None,
         help="number of slices to split the thingi10k dataset into "
         f"(default: {SLICES_PER_WORKER} * number of workers)",
     )
@@ -45,18 +59,28 @@ if __name__ == "__main__":
 
     num_workers = max(1, os.cpu_count() - 9)
     num_slices = (
-        args.num_slices if args.num_slices is not None
+        args.num_slices
+        if args.num_slices is not None
         else num_workers * SLICES_PER_WORKER
     )
     ic(num_workers, num_slices)
 
     tp = ThreadPool(num_workers)
-    for level in range(2, args.max_level):
+    results = []
+    for level in range(2, args.max_level + 1):
         for i in reversed(range(num_slices)):
             slice_str = f"{i}/{num_slices}"
-            tp.apply_async(run_slice, (slice_str, level, args.output_dir))
+            r = tp.apply_async(run_slice, (slice_str, level, args.output_dir))
+            results.append((slice_str, level, r))
 
     tp.close()
     tp.join()
 
-
+    # Report failures
+    failed = [(s, l) for s, l, r in results if r.get() != 0]
+    if failed:
+        print(f"\n{len(failed)} slices failed:", flush=True)
+        for s, l in failed:
+            print(f"  slice={s} level={l}", flush=True)
+    else:
+        print(f"\nAll {len(results)} slices completed successfully.", flush=True)
