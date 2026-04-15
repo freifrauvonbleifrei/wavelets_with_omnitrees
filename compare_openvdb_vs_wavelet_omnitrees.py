@@ -227,6 +227,7 @@ def _write_inside_bool_vdb(disc_init, init_leaf_vals, level: int, vdb_path: str)
         value_transform=lambda v: bool(v > 0.5),
         skip_value=False,
     )
+    grid.prune(tolerance=False)
     vdb.write(vdb_path, grids=[grid])
 
 

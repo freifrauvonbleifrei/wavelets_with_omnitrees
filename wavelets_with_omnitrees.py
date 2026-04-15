@@ -1542,7 +1542,7 @@ def stream_inside_fn_to_float_vdb(
         )
         slice_arr = inside_fn(midpoints).astype(np.float32).reshape(dims, dims, 1)
         grid.copyFromArray(slice_arr, ijk=(0, 0, k))
-    grid.pruneInactive()
+    grid.prune(tolerance=False)
     return grid
 
 
