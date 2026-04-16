@@ -786,6 +786,321 @@ def _merged_node_coefficients(
     return merged_coeffs
 
 
+def downsplit_node_coefficients_general(
+    old_coeffs: Sequence[float],
+    old_ref: ba.bitarray,
+    push_dims: ba.bitarray,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Push ``k_push = push_dims.count()`` dimensions down from a multi-dim node.
+
+    Generalises :func:`downsplit_single_node_coefficients` to ``k_push >= 1``.
+    Reshapes the (length-2^k) coefficient vector as ``C[j_rem, j_push]``
+    (j_rem ∈ {0,1}^{k - k_push}, j_push ∈ {0,1}^{k_push}), then:
+
+      * the new parent's coefficients are the j_push = 0 column (length 2^{k_rem});
+      * each intermediate node sits at remaining-dim slot ``r`` (Morton order),
+        carries ``k_push`` refined dims, and gets the length-2^{k_push} fiber
+        ``intermediate_coeffs[r][j_push] = dehierarchize_along_rem(C[:, j_push])[r]``.
+
+    The intermediate's scaling slot (j_push = 0) holds the actual scaling value;
+    the caller may NaN it out if it follows the ``coefficients[i][0] = NaN``
+    convention.
+    """
+    k = old_ref.count()
+    assert k >= 2
+    assert (push_dims & ~old_ref).count() == 0, (
+        "push_dims must be a subset of old_ref"
+    )
+    k_push = push_dims.count()
+    assert 1 <= k_push <= k - 1, (
+        f"k_push={k_push} must be in [1, {k - 1}] (cannot push all dims)"
+    )
+    k_rem = k - k_push
+    n_push_slots = 1 << k_push
+    n_rem_slots = 1 << k_rem
+
+    refined_dims = get_refined_dimensions_desc(old_ref)
+    push_local_indices = sorted(
+        get_local_bit_index(d, refined_dims)
+        for d in range(len(old_ref))
+        if push_dims[d]
+    )
+    rem_local_indices = [i for i in range(k) if i not in push_local_indices]
+
+    # Reshape old_coeffs as C[j_rem, j_push].  Preserve NaN at the scaling
+    # slot (j = 0) so the new parent inherits the NaN-by-convention.
+    C = np.full((n_rem_slots, n_push_slots), np.nan, dtype=np.float64)
+    for j in range(1 << k):
+        j_bits = bitarray.util.int2ba(j, length=k)
+        push_bits = ba.bitarray([j_bits[i] for i in push_local_indices])
+        rem_bits = ba.bitarray([j_bits[i] for i in rem_local_indices])
+        j_push_idx = bitarray.util.ba2int(push_bits) if k_push > 0 else 0
+        j_rem_idx = bitarray.util.ba2int(rem_bits) if k_rem > 0 else 0
+        C[j_rem_idx, j_push_idx] = float(old_coeffs[j])
+
+    # New parent: j_push = 0 column (keeps NaN at the scaling slot).
+    new_parent_coeffs = C[:, 0].copy()
+
+    # For each j_push column, dehierarchize across the remaining dims to get
+    # one value per intermediate (r in [0, n_rem_slots)).  The Haar inverse
+    # can't tolerate NaN, so feed it a NaN→0 copy.
+    C_for_haar = np.where(np.isnan(C), 0.0, C)
+    fibers = np.zeros((n_push_slots, n_rem_slots), dtype=np.float64)
+    for j_push in range(n_push_slots):
+        fibers[j_push] = dehierarchize(C_for_haar[:, j_push], k_rem)
+
+    intermediate_coeffs = [
+        fibers[:, r].astype(np.float64, copy=True)
+        for r in range(n_rem_slots)
+    ]
+    return new_parent_coeffs, intermediate_coeffs
+
+
+def merged_node_coefficients_general(
+    absorbed_children_coeffs: Sequence[Sequence[float]],
+    intermediate_coeffs: Sequence[float],
+    push_dims: ba.bitarray,
+    merged_ref: ba.bitarray,
+) -> np.ndarray:
+    """Compute wavelet coefficients for a merged non-leaf node when ``k_push >= 1``.
+
+    Generalises :func:`_merged_node_coefficients`.  When ``k_push`` dims are
+    pushed down and the ``2^{k_push}`` siblings under one intermediate share
+    the same refinement disjoint from ``push_dims``, they get absorbed into a
+    single merged node with refinement ``merged_ref = child_ref | push_dims``.
+
+    The merged node's coefficients are obtained by applying the ``k_push``-dim
+    Haar matrix along the absorbed-children axis::
+
+        merged[j_push, j_child] = Σ_{i_push} H_{k_push}[j_push, i_push]
+                                   * absorbed[i_push, j_child]
+
+    For ``j_child = 0`` (the children's NaN-by-convention scaling slot), the
+    transform's input is ill-defined; the column is restored to convention:
+    ``merged[0, 0] = NaN`` (merged scaling) and
+    ``merged[i_push>0, 0] = intermediate_coeffs[i_push]`` (the pushed-dim
+    detail values produced by :func:`downsplit_node_coefficients_general`).
+
+    Args:
+        absorbed_children_coeffs: ``2^{k_push}`` coefficient vectors, each of
+            length ``2^{k_child} = 2^{merged_ref.count() - k_push}``, indexed
+            by the absorbed-child position ``i_push`` in Morton order on the
+            ``push_dims`` bits.
+        intermediate_coeffs: length-``2^{k_push}`` vector of intermediate
+            coefficients (only entries ``i_push > 0`` are used).
+        push_dims: bitarray of pushed (absorbed) global dimensions.
+        merged_ref: refinement bitarray of the merged node
+            (= child_ref | push_dims).
+
+    Returns:
+        Length-``2^{merged_ref.count()}`` numpy array of merged coefficients,
+        with NaN at the merged scaling slot.
+    """
+    k_merged = merged_ref.count()
+    k_push = push_dims.count()
+    assert (push_dims & ~merged_ref).count() == 0, (
+        "push_dims must be a subset of merged_ref"
+    )
+    assert 1 <= k_push <= k_merged
+    n_push_slots = 1 << k_push
+    n_child_slots = 1 << (k_merged - k_push)
+    assert len(absorbed_children_coeffs) == n_push_slots
+    assert len(intermediate_coeffs) == n_push_slots
+
+    # Build (2^k_push, 2^k_child) array with NaN scaling slots zeroed.
+    children_arr = np.zeros((n_push_slots, n_child_slots), dtype=np.float64)
+    for i_push, child_c in enumerate(absorbed_children_coeffs):
+        assert len(child_c) == n_child_slots
+        for j_child in range(n_child_slots):
+            v = child_c[j_child]
+            v = 0.0 if (isinstance(v, float) and np.isnan(v)) else float(v)
+            children_arr[i_push, j_child] = v
+
+    # Apply k_push-dim Haar along the absorbed-children axis.
+    H = hierarchization_matrix(k_push)
+    transformed = (H @ children_arr).astype(np.float64)
+
+    # Restore the j_child = 0 column convention.
+    transformed[0, 0] = np.nan
+    for i_push in range(1, n_push_slots):
+        transformed[i_push, 0] = float(intermediate_coeffs[i_push])
+
+    # Re-permute (j_push, j_child) → flat j in merged_ref's local order.
+    merged_local = get_refined_dimensions_desc(merged_ref)
+    push_local_indices = sorted(
+        get_local_bit_index(d, merged_local)
+        for d in range(len(merged_ref))
+        if push_dims[d]
+    )
+    keep_local_indices = [
+        i for i in range(k_merged) if i not in push_local_indices
+    ]
+
+    merged = np.empty(1 << k_merged, dtype=np.float64)
+    for j in range(1 << k_merged):
+        j_bits = bitarray.util.int2ba(j, length=k_merged)
+        jp_bits = ba.bitarray([j_bits[p] for p in push_local_indices])
+        jc_bits = ba.bitarray([j_bits[p] for p in keep_local_indices])
+        jp = bitarray.util.ba2int(jp_bits) if k_push > 0 else 0
+        jc = bitarray.util.ba2int(jc_bits) if (k_merged - k_push) > 0 else 0
+        merged[j] = transformed[jp, jc]
+    return merged
+
+
+def apply_downsplits_general(
+    discretization: "dyada.discretization.Discretization",
+    coefficients: list[np.ndarray],
+    plans: list[tuple[int, ba.bitarray]],
+) -> tuple["dyada.discretization.Discretization", list[np.ndarray]]:
+    """Apply a batch of (possibly multi-dim) downsplits and update coefficients.
+
+    Generalises the coefficient-update logic in
+    :func:`compress_by_downsplit_coarsening` to arbitrary ``k_push``.  Uses
+    :func:`downsplit_node_coefficients_general` and
+    :func:`merged_node_coefficients_general` for the new parent / intermediate
+    / merged-node coefficients.
+
+    ``coefficients`` is a list of one ``np.ndarray`` per descriptor node;
+    each entry is a length-``2^{ref.count()}`` array (or length-1 for leaves),
+    with ``np.nan`` at the scaling slot ``[0]`` per convention (except at the
+    root, where ``[0]`` carries the global scaling).  The returned list has
+    the same shape, indexed by the new descriptor's nodes.
+    """
+    from dyada.downsplit import apply_planned_downsplits
+
+    old_disc = discretization
+    new_disc, pd_mapping = apply_planned_downsplits(
+        old_disc, plans, track_mapping="patches"
+    )
+    plans_dict = {old_i: ba.bitarray(d) for old_i, d in plans}
+
+    # Build, for each split parent, the absorbed-child groups.
+    # pos_to_old[old_i][j_push_idx_within_parent_ref] = old child desc index
+    linearization = old_disc._linearization
+    old_pos_to_child: dict[int, dict[ba.frozenbitarray, int]] = {}
+    for old_i in plans_dict:
+        old_ref = ba.bitarray(old_disc.descriptor[old_i])
+        per_parent: dict[ba.frozenbitarray, int] = {}
+        for child_pos, child_idx in enumerate(
+            old_disc.descriptor.get_children(old_i)
+        ):
+            child_bits = linearization.get_binary_position_from_index(
+                [child_pos], [old_ref]
+            )
+            per_parent[ba.frozenbitarray(child_bits)] = child_idx
+        old_pos_to_child[old_i] = per_parent
+
+    new_coefficients: list[np.ndarray] = [
+        np.array([np.nan], dtype=np.float64)
+        for _ in range(len(new_disc.descriptor))
+    ]
+    handled_new: set[int] = set()
+
+    for old_i, push_dims in plans_dict.items():
+        old_ref = ba.bitarray(old_disc.descriptor[old_i])
+        remaining_ref = old_ref & ~push_dims
+        new_parent_coeffs, interm_list = downsplit_node_coefficients_general(
+            coefficients[old_i], old_ref, push_dims
+        )
+
+        # Find the new parent (the unique node in pd_mapping[old_i] with
+        # ref == remaining_ref).
+        new_parent_i = next(
+            ni
+            for ni in pd_mapping[old_i]
+            if ba.bitarray(new_disc.descriptor[ni]) == remaining_ref
+        )
+        new_coefficients[new_parent_i] = np.asarray(
+            new_parent_coeffs, dtype=np.float64
+        )
+        handled_new.add(new_parent_i)
+
+        # Walk new parent's children — each is either an intermediate
+        # (ref == push_dims, holding the unmerged subtree) or a merged
+        # node (ref ⊇ push_dims).
+        for r, (child_start, _) in enumerate(
+            new_disc.descriptor.get_child_ranges(new_parent_i)
+        ):
+            child_ref = ba.bitarray(new_disc.descriptor[child_start])
+            if child_ref == push_dims:
+                # Plain intermediate — write its push-axis fiber, NaN-out the
+                # scaling slot per convention.
+                ic = np.asarray(interm_list[r], dtype=np.float64).copy()
+                ic[0] = np.nan
+                new_coefficients[child_start] = ic
+                handled_new.add(child_start)
+            elif (child_ref & push_dims) == push_dims and child_ref != push_dims:
+                # Merged non-leaf: ref = absorbed_child_ref | push_dims.
+                absorbed_child_ref = child_ref & ~push_dims
+                # Find the 2^k_push absorbed old children at remaining-pos r.
+                rem_local_indices = [
+                    i for i in range(len(old_ref))
+                    if old_ref[i] and not push_dims[i]
+                ]
+                refined_dims_old = get_refined_dimensions_desc(old_ref)
+                rem_local_in_old = sorted(
+                    get_local_bit_index(d, refined_dims_old)
+                    for d in rem_local_indices
+                )
+                push_local_in_old = sorted(
+                    get_local_bit_index(d, refined_dims_old)
+                    for d in range(len(old_ref))
+                    if push_dims[d]
+                )
+                k_push = push_dims.count()
+                k_rem = old_ref.count() - k_push
+                # Convert flat r → bits in remaining-dim local order
+                r_bits_local = bitarray.util.int2ba(r, length=k_rem) \
+                    if k_rem > 0 else ba.bitarray()
+
+                absorbed: list[np.ndarray] = []
+                interm_fiber = np.asarray(interm_list[r], dtype=np.float64)
+                for i_push in range(1 << k_push):
+                    ip_bits_local = bitarray.util.int2ba(i_push, length=k_push)
+                    # Build the full child position bits in old_ref's local order.
+                    full_local = ba.bitarray(old_ref.count())
+                    full_local.setall(0)
+                    for li, p in enumerate(push_local_in_old):
+                        full_local[p] = ip_bits_local[li]
+                    for li, p in enumerate(rem_local_in_old):
+                        full_local[p] = r_bits_local[li] if k_rem > 0 else 0
+                    # Map local-index bits back to global-position bits.
+                    full_global = ba.bitarray(len(old_ref))
+                    full_global.setall(0)
+                    for li, gd in enumerate(refined_dims_old):
+                        full_global[gd] = full_local[li]
+                    old_child_idx = old_pos_to_child[old_i][
+                        ba.frozenbitarray(full_global)
+                    ]
+                    absorbed.append(coefficients[old_child_idx])
+
+                merged = merged_node_coefficients_general(
+                    absorbed, interm_fiber, push_dims, child_ref
+                )
+                new_coefficients[child_start] = np.asarray(
+                    merged, dtype=np.float64
+                )
+                handled_new.add(child_start)
+
+                # Walk subtree of merged node — its descendants are the
+                # original grandchildren rearranged by apply_planned_downsplits;
+                # their coefficients are unchanged but their indices may have
+                # shifted.  The patch-mapping pd_mapping links them.
+            # else: should not happen for a valid downsplit / merge.
+
+    # Copy unchanged coefficients (everything outside split-parent subtrees,
+    # plus the leaves/grandchildren under handled new nodes).
+    for old_i, new_i_set in enumerate(pd_mapping):
+        for new_i in new_i_set:
+            if new_i in handled_new:
+                continue
+            new_coefficients[new_i] = np.asarray(
+                coefficients[old_i], dtype=np.float64
+            ).copy()
+
+    return new_disc, new_coefficients
+
+
 def compress_by_downsplit_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],

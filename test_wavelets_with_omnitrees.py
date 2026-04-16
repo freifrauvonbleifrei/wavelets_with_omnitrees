@@ -1,16 +1,14 @@
-import os
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
+import random
 
 import dyada
 import dyada.descriptor
 import dyada.discretization
 import dyada.linearization
-
-import pytest
 
 import bitarray as ba
 
@@ -21,6 +19,8 @@ from wavelets_with_omnitrees import (
     compress_by_omnitree_coarsening,
     compress_by_downsplit_coarsening,
     compress_by_level_sweep_coarsening,
+    apply_downsplits_general,
+    normalize_uniqueness,
 )
 from compare_openvdb_vs_wavelet_omnitrees import (
     _sample_at_finest_midpoints,
@@ -755,3 +755,115 @@ class TestReconstructFromFile:
             get_leaf_scalings(disc_ls2, coeff_ls2),
             get_leaf_scalings(disc_ls, coeff_ls),
         )
+
+
+def test_3d_random_multi_dim_downsplits_roundtrip():
+    """Sequential vs batched downsplits on a 3D level-[2,3,3] grid.
+
+    1.  Build a 3D level-[2,3,3] full grid (4×8×8 = 256 cells).
+    2.  Initialise the 256 nodal coefficients randomly and hierarchise.
+    3.  Pre-generate a *shared* plan list: for every node with refinement
+        ``111`` (root + level-1 children), draw one of three push options
+        — ``{dim 1}``, ``{dim 2}``, or ``{dim 1, dim 2}``.
+    3a) Apply the plans sequentially, **highest-index node first**, so each
+        next plan's recorded index remains valid in the evolving tree.
+    3b) Apply the same plans in a single batched ``apply_downsplits_general``
+        call.  The two final (descriptor, coefficients) pairs must agree
+        before normalisation.
+    4.  Print all four trees (3a, 3b, and their normalised forms).
+    5.  Normalise both and assert they collapse back to the initial full
+        grid descriptor + coefficients.
+    """
+    rng = random.Random(0xDEADBEEF)
+    np_rng = np.random.default_rng(0xDEADBEEF)
+
+    # 1) 3D level-[2,3,3] full grid → 256 leaves.
+    disc_init = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(),
+        dyada.descriptor.RefinementDescriptor(3, [2, 3, 3]),
+    )
+    assert len(disc_init) == 256
+
+    # 2) Random nodal coefficients → wavelet coefficients (NaN-scaling
+    # convention, with the root scaling preserved).
+    nodal = np_rng.standard_normal(256)
+    coeff_init_raw = transform_to_all_wavelet_coefficients(disc_init, nodal)
+    coeff_init: list[np.ndarray] = [
+        np.asarray(c, dtype=np.float64).copy() for c in coeff_init_raw
+    ]
+    root_scaling = coeff_init[0][0]
+    for c in coeff_init:
+        c[0] = np.nan
+
+    # 3) Shared plan list: one push option per first-level node
+    PUSH_OPTIONS = [
+        ba.bitarray("010"),  # push dim 1
+        ba.bitarray("001"),  # push dim 2
+        ba.bitarray("011"),  # push dims 1 and 2
+    ]
+    target_ref = ba.bitarray("111")
+    plans_initial: list[tuple[int, ba.bitarray]] = []
+    for i in range(1, len(disc_init.descriptor)):  # skip root #TODO?
+        if ba.bitarray(disc_init.descriptor[i]) == target_ref:
+            plans_initial.append((i, ba.bitarray(rng.choice(PUSH_OPTIONS))))
+    print()
+    print(f"shared plan list ({len(plans_initial)} plans):")
+    for old_idx, push_ba in plans_initial:
+        print(f"     old_idx={old_idx:3d} push={push_ba.to01()}")
+
+    # ── 3a) Sequential downsplits, highest-index node first ────────────
+    disc, coefficients = disc_init, [c.copy() for c in coeff_init]
+    for plan in sorted(plans_initial, key=lambda p: p[0], reverse=True):
+        disc, coefficients = apply_downsplits_general(disc, coefficients, [plan])
+
+    disc_seq, coeff_seq = disc, coefficients
+
+    # ── 3b) Batched downsplits — same plan list, single call ───────────
+    disc_batch, coeff_batch = apply_downsplits_general(
+        disc_init, [c.copy() for c in coeff_init], plans_initial
+    )
+
+    # ── Pre-normalisation: 3a and 3b must produce identical results ────
+    assert disc_seq.descriptor._data == disc_batch.descriptor._data, (
+        "sequential and batched downsplits produced different descriptors\n"
+        f"3a: {disc_seq.descriptor._data.to01()}\n"
+        f"3b: {disc_batch.descriptor._data.to01()}"
+    )
+    assert len(coeff_seq) == len(coeff_batch)
+    for i, (cs, cb) in enumerate(zip(coeff_seq, coeff_batch)):
+        np.testing.assert_allclose(
+            cs,
+            cb,
+            rtol=1e-10,
+            atol=1e-12,
+            equal_nan=True,
+            err_msg=f"sequential vs batched: coefficients differ at node {i}",
+        )
+
+    # 4) Normalise both and assert each collapses back to the initial full
+    # grid (descriptor + coefficients).
+    disc_seq_n, coeff_seq_n = normalize_uniqueness(disc_seq, coeff_seq)
+    disc_batch_n, coeff_batch_n = normalize_uniqueness(disc_batch, coeff_batch)
+
+    coeff_seq_n[0][0] = root_scaling
+    coeff_batch_n[0][0] = root_scaling
+    coeff_init[0][0] = root_scaling
+    for label, d_norm, coeffs_n in (
+        ("3a sequential", disc_seq_n, coeff_seq_n),
+        ("3b batch", disc_batch_n, coeff_batch_n),
+    ):
+        assert (
+            d_norm.descriptor._data == disc_init.descriptor._data
+        ), f"{label}: normalised descriptor differs from initial full grid"
+        assert len(coeffs_n) == len(
+            coeff_init
+        ), f"{label}: normalised coefficient list length mismatch"
+        for i, (c_norm, c_init) in enumerate(zip(coeffs_n, coeff_init)):
+            np.testing.assert_allclose(
+                c_norm,
+                c_init,
+                rtol=1e-10,
+                atol=1e-12,
+                equal_nan=True,
+                err_msg=f"{label}: normalised coefficient at node {i} differs",
+            )
