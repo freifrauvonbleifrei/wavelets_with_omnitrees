@@ -929,10 +929,6 @@ def compress_by_downsplit_coarsening(
 
     while True:
         # ── Downsplit round ─────────────────────────────────────────────────
-        # Split the deepest multi-dim nodes first (by tree depth).  This avoids
-        # ancestor–descendant pairs in the same batch while being less
-        # restrictive than the old frontier check (which required all children
-        # to have count() <= 1).
         descriptor = discretization.descriptor
         nd = descriptor.get_num_dimensions()
         node_levels = _compute_node_levels(descriptor)
@@ -1211,9 +1207,7 @@ def compress_by_downsplit_coarsening(
                 violation_involved.add(phi)
                 violation_involved.update(children_hi)
 
-            # Place coefficients at new positions.  Start with None and
-            # backfill unset slots with the leaf [nan] placeholder after the
-            # three passes, so we don't allocate a million throwaway arrays.
+            # Place coefficients at new positions, start with None
             new_coefficients: list[Optional[np.ndarray]] = [None] * len(
                 discretization.descriptor
             )
@@ -1305,10 +1299,12 @@ def compress_by_downsplit_coarsening(
                         ).copy()
                         break
 
-            # Backfill any slots that none of the three passes reached.
-            for i in range(len(new_coefficients)):
-                if new_coefficients[i] is None:
-                    new_coefficients[i] = np.array([np.nan], dtype=np.float64)
+            # Invariant: passes 1–3 cover every new index.
+            unreached = [i for i, c in enumerate(new_coefficients) if c is None]
+            assert not unreached, (
+                f"normalize: {len(unreached)} slot(s) unreached by passes 1-3: "
+                f"{[(i, ba.bitarray(discretization.descriptor[i]).to01()) for i in unreached[:10]]}"
+            )
 
             coefficients = new_coefficients
 
