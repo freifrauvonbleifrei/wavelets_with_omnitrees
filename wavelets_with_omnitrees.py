@@ -941,6 +941,13 @@ def compress_by_downsplit_coarsening(
             num_bits_set = descriptor[desc_index].count()
             if num_bits_set < 2:
                 continue
+            # # check if any 2 children are leaves
+            num_leaf_children = sum(
+                1 if descriptor.is_box(c) else 0
+                for c in descriptor.get_children(desc_index)
+            )
+            if num_leaf_children < 2:
+                continue
             depth = int(np.sum(node_levels[desc_index]))
             candidates.append((desc_index, depth))
         planned_downsplits: list[tuple[int, ba.bitarray]] = []
