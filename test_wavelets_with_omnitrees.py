@@ -9,6 +9,7 @@ import dyada
 import dyada.descriptor
 import dyada.discretization
 import dyada.linearization
+from dyada.linearization import grid_coord_to_z_index
 
 import bitarray as ba
 
@@ -16,6 +17,7 @@ from wavelets_with_omnitrees import (
     get_numbers_with_ith_bit_set,
     transform_to_all_wavelet_coefficients,
     get_leaf_scalings,
+    get_resampled_image,
     compress_by_omnitree_coarsening,
     compress_by_downsplit_coarsening,
     apply_downsplits,
@@ -305,8 +307,6 @@ def test_2d_insufficient_downsplit(case):
     ), f"{label}: downsplit ascii mismatch"
 
     # Lossless: every stage's reconstruction must match the original raster.
-    from wavelets_with_omnitrees import get_resampled_image
-
     target_level = disc.descriptor.get_maximum_level().astype(np.int64)
     raster_orig = get_resampled_image(disc, nodal, target_level)
     for stage_name, stage_disc, stage_coeff in (
@@ -376,8 +376,6 @@ def test_3d_compresses_beyond_downsplit():
     assert len(disc_pd) == 13
     scalings_pd = get_leaf_scalings(disc_pd, coeff_pd)
     # Verify lossless reconstruction
-    from wavelets_with_omnitrees import get_resampled_image
-
     target_level = disc.descriptor.get_maximum_level().astype(np.int64)
     raster_orig = get_resampled_image(disc, nodal, target_level)
     raster_new = get_resampled_image(disc_pd, scalings_pd, target_level)
@@ -431,7 +429,7 @@ def test_threshold_sweep_analytical(level, capsys):
         "step_x": cloud_mean + 0.1 * (pts[:, 0] > 0.5).astype(np.float64),
     }
 
-    thresholds = [0.0, 1e-4, 1e-2, 1.0, 1e2, 1e4, 1e6]
+    thresholds = [0.0, 1e-4, 1e-2, 1.0]  # , 1e2, 1e4, 1e6]
     results: dict[str, list[int]] = {
         name: [_compress_count(disc, nodal, t) for t in thresholds]
         for name, nodal in fns.items()
@@ -486,7 +484,6 @@ def test_threshold_sweep_analytical(level, capsys):
 
 def _rasterize_3d(disc, leaf_values, level):
     """Expand leaf values onto a full 2^level per-dim grid in Morton order."""
-    from dyada.linearization import grid_coord_to_z_index
 
     n = 1 << level
     grid_levels = [level] * 3

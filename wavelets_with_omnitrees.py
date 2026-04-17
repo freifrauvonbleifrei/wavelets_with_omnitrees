@@ -513,13 +513,9 @@ def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
 
 
 def _subset_local_to_global_bits(absorbed_slot: int, absorbed_dims: ba.bitarray):
-    absorbed_globals = bitmask_to_indices(absorbed_dims)
-    global_ba = ba.bitarray(len(absorbed_dims))
-    global_ba.setall(False)
-    for local_i, gdim in enumerate(absorbed_globals):
-        if (absorbed_slot >> local_i) & 1:
-            global_ba[gdim] = True
-    return global_ba
+    return dyada.linearization.MortonOrderLinearization.get_binary_position_from_index(
+        [absorbed_slot], [absorbed_dims]
+    )
 
 
 def reverse_downsplit_coefficients(
@@ -549,7 +545,6 @@ def reverse_downsplit_coefficients(
     k_merged = merged_ref.count()
     k_absorbed = absorbed_dims.count()
     n_absorbed_slots = 1 << k_absorbed
-    ndim = len(parent_ref)
 
     # Normalize children_refs to a list
     if isinstance(children_refs, ba.bitarray):
@@ -782,7 +777,6 @@ def apply_downsplits(
     """
 
     old_disc = discretization
-    nd = discretization.descriptor.get_num_dimensions()
     new_disc, pd_mapping = apply_planned_downsplits(
         old_disc, plans, track_mapping="patches"
     )
@@ -931,8 +925,7 @@ def compress_by_downsplit_coarsening(
         # ── Downsplit round ─────────────────────────────────────────────────
         descriptor = discretization.descriptor
         nd = descriptor.get_num_dimensions()
-        node_levels = _compute_node_levels(descriptor)
-        candidates: list[tuple[int, int]] = []  # (desc_index, depth)
+        candidates: list[int] = []
         for desc_index in range(len(descriptor)):
             num_bits_set = descriptor[desc_index].count()
             if num_bits_set < 2:
@@ -944,10 +937,9 @@ def compress_by_downsplit_coarsening(
             )
             if num_leaf_children < 2:
                 continue
-            depth = int(np.sum(node_levels[desc_index]))
-            candidates.append((desc_index, depth))
+            candidates.append(desc_index)
         planned_downsplits: list[tuple[int, ba.bitarray]] = []
-        for desc_index, depth in candidates:
+        for desc_index in candidates:
             current_ref = ba.bitarray(discretization.descriptor[desc_index])
             # Split the dim with the smallest pure 1D detail coefficient.
             k = current_ref.count()
@@ -1036,7 +1028,7 @@ def compress_by_downsplit_coarsening(
                 new_parent_coeffs, interm_coeffs = downsplit_node_coefficients(
                     coefficients[old_i],
                     old_ref,
-                    indices_to_bitmask([down_dim], nd),
+                    indices_to_bitmask([down_dim], num_dimensions),
                 )
 
                 # The new parent is the unique node in new_i_set with ref == remaining_ref.
@@ -1071,7 +1063,7 @@ def compress_by_downsplit_coarsening(
                         new_coefficients[child_start] = merged_node_coefficients(
                             [coefficients[childA_idx], coefficients[childB_idx]],
                             interm_coeffs[r],  # full push fiber; only [1] is used
-                            indices_to_bitmask([down_dim], nd),
+                            indices_to_bitmask([down_dim], num_dimensions),
                             merged_ref,
                         )
                         merged_new_indices.add(child_start)
