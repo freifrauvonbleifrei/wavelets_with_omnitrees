@@ -499,24 +499,6 @@ def _one_d_coeff_index(d_local: int, k: int) -> int:
     return 1 << (k - 1 - d_local)
 
 
-def downsplit_single_node_coefficients(
-    old_coeffs: Sequence[float],
-    old_ref: ba.bitarray,
-    down_dim: int,
-) -> tuple[np.ndarray, list[np.ndarray]]:
-    """Single-dim push case of :func:`downsplit_node_coefficients_general`.
-
-    Returns ``(new_parent_coeffs, intermediate_coeffs)`` for downsplitting
-    one dimension; preserved for backward compatibility.  Each intermediate
-    is a length-2 ``[scaling, detail_d]`` array.
-    """
-    return downsplit_node_coefficients_general(
-        old_coeffs,
-        old_ref,
-        ba.bitarray(dyada.linearization.indices_to_bitmask([down_dim], len(old_ref))),
-    )
-
-
 def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
     """Compute the coefficient array index for a subset of global dims within ref.
 
@@ -567,18 +549,19 @@ def reverse_downsplit_coefficients(
 
     # ── Merged parent coefficients ──────────────────────────────────────────
     raw_fibers = np.zeros((n_parent_children, n_absorbed_slots), dtype=np.float64)
-    for T2 in range(n_absorbed_slots):
-        t2_global = _subset_local_to_global_bits(T2, absorbed_dims, ndim)
+    for t2 in range(n_absorbed_slots):
+        t2_ba = bitarray.util.int2ba(t2, ndim)
+        t2_global = t2_ba & absorbed_dims
         for j in range(n_parent_children):
             idx = _subset_index_in_ref(t2_global, per_child_ref[j])
-            raw_fibers[j, T2] = float(children_coeffs[j][idx])
+            raw_fibers[j, t2] = float(children_coeffs[j][idx])
 
     fibers = hierarchization_matrix(k_parent) @ raw_fibers
     fibers[:, 0] = np.asarray(parent_coeffs, dtype=np.float64)
 
     # Re-permute fibers (parent_ref local order, then absorbed local order)
     # into merged_ref's local axis order, then flatten — same reshape/transpose
-    # pattern used by the ``_general`` helpers.
+    # pattern used by helpers.
     absorbed_local, parent_local = _local_split_indices(merged_ref, absorbed_dims)
     perm = parent_local + absorbed_local
     inv_perm = [0] * k_merged
@@ -632,30 +615,7 @@ def reverse_downsplit_coefficients(
     return merged_coeffs, split_children
 
 
-def _merged_node_coefficients(
-    childA_coeffs: Sequence[float],
-    childB_coeffs: Sequence[float],
-    intermediate_detail: float,
-    down_dim: int,
-    merged_ref: ba.bitarray,
-) -> np.ndarray:
-    """Single-dim push case of :func:`merged_node_coefficients_general`.
-
-    Two siblings (childA at ``down_dim=0``, childB at ``down_dim=1``) get
-    absorbed into a single merged node; preserved for backward compatibility
-    with :func:`compress_by_downsplit_coarsening`.
-    """
-    push_dims = ba.bitarray(len(merged_ref))
-    push_dims.setall(0)
-    push_dims[down_dim] = 1
-    # j_push = 0 entry is overwritten with NaN inside the general helper
-    intermediates = np.array([np.nan, intermediate_detail], dtype=np.float64)
-    return merged_node_coefficients_general(
-        [childA_coeffs, childB_coeffs], intermediates, push_dims, merged_ref
-    )
-
-
-def downsplit_node_coefficients_general(
+def downsplit_node_coefficients(
     old_coeffs: Sequence[float],
     old_ref: ba.bitarray,
     push_dims: ba.bitarray,
@@ -711,7 +671,7 @@ def downsplit_node_coefficients_general(
     return new_parent_coeffs, intermediate_coeffs
 
 
-def merged_node_coefficients_general(
+def merged_node_coefficients(
     absorbed_children_coeffs: Sequence[Sequence[float]],
     intermediate_coeffs: Sequence[float],
     push_dims: ba.bitarray,
@@ -734,7 +694,7 @@ def merged_node_coefficients_general(
     transform's input is ill-defined; the column is restored to convention:
     ``merged[0, 0] = NaN`` (merged scaling) and
     ``merged[i_push>0, 0] = intermediate_coeffs[i_push]`` (the pushed-dim
-    detail values produced by :func:`downsplit_node_coefficients_general`).
+    detail values produced by :func:`downsplit_node_coefficients`).
 
     Args:
         absorbed_children_coeffs: ``2^{k_push}`` coefficient vectors, each of
@@ -791,7 +751,7 @@ def merged_node_coefficients_general(
     )
 
 
-def apply_downsplits_general(
+def apply_downsplits(
     discretization: "dyada.discretization.Discretization",
     coefficients: list[np.ndarray],
     plans: list[tuple[int, ba.bitarray]],
@@ -800,8 +760,8 @@ def apply_downsplits_general(
 
     Generalises the coefficient-update logic in
     :func:`compress_by_downsplit_coarsening` to arbitrary ``k_push``.  Uses
-    :func:`downsplit_node_coefficients_general` and
-    :func:`merged_node_coefficients_general` for the new parent / intermediate
+    :func:`downsplit_node_coefficients` and
+    :func:`merged_node_coefficients` for the new parent / intermediate
     / merged-node coefficients.
 
     ``coefficients`` is a list of one ``np.ndarray`` per descriptor node;
@@ -812,6 +772,7 @@ def apply_downsplits_general(
     """
 
     old_disc = discretization
+    nd = discretization.descriptor.get_num_dimensions()
     new_disc, pd_mapping = apply_planned_downsplits(
         old_disc, plans, track_mapping="patches"
     )
@@ -839,7 +800,7 @@ def apply_downsplits_general(
     for old_i, push_dims in plans_dict.items():
         old_ref = ba.bitarray(old_disc.descriptor[old_i])
         remaining_ref = old_ref & ~push_dims
-        new_parent_coeffs, interm_list = downsplit_node_coefficients_general(
+        new_parent_coeffs, interm_list = downsplit_node_coefficients(
             coefficients[old_i], old_ref, push_dims
         )
 
@@ -911,7 +872,7 @@ def apply_downsplits_general(
                     ]
                     absorbed.append(coefficients[old_child_idx])
 
-                merged = merged_node_coefficients_general(
+                merged = merged_node_coefficients(
                     absorbed, interm_fiber, push_dims, child_ref
                 )
                 new_coefficients[child_start] = np.asarray(merged, dtype=np.float64)
@@ -969,6 +930,7 @@ def compress_by_downsplit_coarsening(
         # restrictive than the old frontier check (which required all children
         # to have count() <= 1).
         descriptor = discretization.descriptor
+        nd = descriptor.get_num_dimensions()
         node_levels = _compute_node_levels(descriptor)
         candidates: list[tuple[int, int]] = []  # (desc_index, depth)
         for desc_index in range(len(descriptor)):
@@ -1068,8 +1030,10 @@ def compress_by_downsplit_coarsening(
                 remaining_ref = old_ref.copy()
                 remaining_ref[down_dim] = 0
 
-                new_parent_coeffs, interm_coeffs = downsplit_single_node_coefficients(
-                    coefficients[old_i], old_ref, down_dim
+                new_parent_coeffs, interm_coeffs = downsplit_node_coefficients(
+                    coefficients[old_i],
+                    old_ref,
+                    indices_to_bitmask([down_dim], nd),
                 )
 
                 # The new parent is the unique node in new_i_set with ref == remaining_ref.
@@ -1101,11 +1065,10 @@ def compress_by_downsplit_coarsening(
                         merged_ref = child_ref
                         child_orig_ref = merged_ref.copy()
                         child_orig_ref[down_dim] = 0
-                        new_coefficients[child_start] = _merged_node_coefficients(
-                            coefficients[childA_idx],
-                            coefficients[childB_idx],
+                        new_coefficients[child_start] = merged_node_coefficients(
+                            [coefficients[childA_idx], coefficients[childB_idx]],
                             interm_coeffs[r][1],  # split-dim detail
-                            down_dim,
+                            indices_to_bitmask([down_dim], nd),
                             merged_ref,
                         )
                         merged_new_indices.add(child_start)
