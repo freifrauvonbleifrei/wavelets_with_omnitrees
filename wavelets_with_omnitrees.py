@@ -17,6 +17,7 @@ import dyada.descriptor
 import dyada.discretization
 from dyada.downsplit import apply_planned_downsplits
 import dyada.linearization
+from dyada.linearization import indices_to_bitmask, bitmask_to_indices
 import dyada.refinement
 
 try:
@@ -511,6 +512,16 @@ def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
     )
 
 
+def _subset_local_to_global_bits(absorbed_slot: int, absorbed_dims: ba.bitarray):
+    absorbed_globals = bitmask_to_indices(absorbed_dims)
+    global_ba = ba.bitarray(len(absorbed_dims))
+    global_ba.setall(False)
+    for local_i, gdim in enumerate(absorbed_globals):
+        if (absorbed_slot >> local_i) & 1:
+            global_ba[gdim] = True
+    return global_ba
+
+
 def reverse_downsplit_coefficients(
     parent_coeffs: Sequence[float],
     parent_ref: ba.bitarray,
@@ -550,8 +561,7 @@ def reverse_downsplit_coefficients(
     # ── Merged parent coefficients ──────────────────────────────────────────
     raw_fibers = np.zeros((n_parent_children, n_absorbed_slots), dtype=np.float64)
     for t2 in range(n_absorbed_slots):
-        t2_ba = bitarray.util.int2ba(t2, ndim)
-        t2_global = t2_ba & absorbed_dims
+        t2_global = _subset_local_to_global_bits(t2, absorbed_dims)
         for j in range(n_parent_children):
             idx = _subset_index_in_ref(t2_global, per_child_ref[j])
             raw_fibers[j, t2] = float(children_coeffs[j][idx])
@@ -824,9 +834,9 @@ def apply_downsplits(
             if child_ref == push_dims:
                 # Plain intermediate — write its push-axis fiber, NaN-out the
                 # scaling slot per convention.
-                ic = np.asarray(interm_list[r], dtype=np.float64).copy()
-                ic[0] = np.nan
-                new_coefficients[child_start] = ic
+                i_c = np.asarray(interm_list[r], dtype=np.float64).copy()
+                i_c[0] = np.nan
+                new_coefficients[child_start] = i_c
                 handled_new.add(child_start)
             elif (child_ref & push_dims) == push_dims and child_ref != push_dims:
                 # Find the 2^k_push absorbed old children at remaining-pos r.
@@ -1030,6 +1040,12 @@ def compress_by_downsplit_coarsening(
                 remaining_ref = old_ref.copy()
                 remaining_ref[down_dim] = 0
 
+                if not any(
+                    ba.bitarray(discretization.descriptor[ni]) == remaining_ref
+                    for ni in new_i_set
+                ):
+                    continue
+
                 new_parent_coeffs, interm_coeffs = downsplit_node_coefficients(
                     coefficients[old_i],
                     old_ref,
@@ -1053,9 +1069,9 @@ def compress_by_downsplit_coarsening(
                     if k_child <= 1:
                         # Regular (non-merged) intermediate or leaf: use downsplit result.
                         # Restore NaN convention for the scaling slot (index 0).
-                        ic = interm_coeffs[r].copy()
-                        ic[0] = np.nan
-                        new_coefficients[child_start] = ic
+                        i_c = interm_coeffs[r].copy()
+                        i_c[0] = np.nan
+                        new_coefficients[child_start] = i_c
                         merged_new_indices.add(child_start)
                     else:
                         # Merged non-leaf: compute directly in wavelet space.
@@ -1067,7 +1083,7 @@ def compress_by_downsplit_coarsening(
                         child_orig_ref[down_dim] = 0
                         new_coefficients[child_start] = merged_node_coefficients(
                             [coefficients[childA_idx], coefficients[childB_idx]],
-                            interm_coeffs[r][1],  # split-dim detail
+                            interm_coeffs[r],  # full push fiber; only [1] is used
                             indices_to_bitmask([down_dim], nd),
                             merged_ref,
                         )
