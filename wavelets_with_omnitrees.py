@@ -9,7 +9,7 @@ import numpy as np
 import numpy.typing as npt
 from icecream import ic
 from PIL import Image
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Optional, Sequence
 import sys
 
 import dyada
@@ -296,7 +296,7 @@ def morton_to_multidim(
 def get_refined_dimensions_desc(
     refinement: ba.frozenbitarray | ba.bitarray,
 ) -> list[int]:
-    return list(reversed(dyada.linearization.bitmask_to_indices(refinement)))
+    return list(reversed(bitmask_to_indices(refinement)))
 
 
 def get_local_bit_index(
@@ -911,8 +911,6 @@ def compress_by_downsplit_coarsening(
     discretization: dyada.discretization.Discretization,
     coefficients: list[Sequence[float]],
     coarsening_threshold: float = 0.0,
-    *,
-    _depth_schedule: Iterable[int] | None = None,
 ) -> tuple[dyada.discretization.Discretization, list[Sequence[float]], float]:
     """Compress via progressive bottom-up downsplit guided by 1D detail coefficients.
 
@@ -924,13 +922,9 @@ def compress_by_downsplit_coarsening(
     Stop when no coarsenings occur in a round.
 
     Merged non-leaf intermediates are computed directly in the wavelet domain.
-
-    If _depth_schedule is provided, downsplit is applied at each specified depth
-    in order, instead of always targeting the current maximum depth.
     """
 
     num_dimensions = discretization.descriptor.get_num_dimensions()
-    _depth_iter = iter(_depth_schedule) if _depth_schedule is not None else None
     total_discarded_l1 = 0.0
 
     while True:
@@ -944,23 +938,13 @@ def compress_by_downsplit_coarsening(
         node_levels = _compute_node_levels(descriptor)
         candidates: list[tuple[int, int]] = []  # (desc_index, depth)
         for desc_index in range(len(descriptor)):
-            if descriptor[desc_index].count() < 2:
+            num_bits_set = descriptor[desc_index].count()
+            if num_bits_set < 2:
                 continue
             depth = int(np.sum(node_levels[desc_index]))
             candidates.append((desc_index, depth))
-
-        if _depth_iter is not None:
-            try:
-                target_depth = next(_depth_iter)
-            except StopIteration:
-                break
-        else:
-            target_depth = max((d for _, d in candidates), default=-1)
-
         planned_downsplits: list[tuple[int, ba.bitarray]] = []
         for desc_index, depth in candidates:
-            if depth != target_depth:
-                continue
             current_ref = ba.bitarray(discretization.descriptor[desc_index])
             # Split the dim with the smallest pure 1D detail coefficient.
             k = current_ref.count()
@@ -1115,7 +1099,7 @@ def compress_by_downsplit_coarsening(
         total_discarded_l1 += round_discarded
 
         # ── Rollback uncoarsened downsplits ──────────────────────────────
-        if _depth_iter is None and planned_downsplits and not planned_any:
+        if planned_downsplits and not planned_any:
             discretization = pre_ds_disc
             coefficients = pre_ds_coeffs
             break
@@ -1321,7 +1305,7 @@ def compress_by_downsplit_coarsening(
 
             coefficients = new_coefficients
 
-        if _depth_iter is None and not planned_any:
+        if not planned_any:
             break
 
     return discretization, coefficients, total_discarded_l1
@@ -1468,59 +1452,6 @@ def normalize_uniqueness(
                     break
         coeffs = new_coefficients
     return disc, coeffs
-
-
-def compress_by_level_sweep_coarsening(
-    discretization: dyada.discretization.Discretization,
-    coefficients: list[Sequence[float]],
-    coarsening_threshold: float = 0.0,
-) -> tuple[dyada.discretization.Discretization, list[Sequence[float]], float]:
-    """Continue compression from a downsplit result by sweeping lower depths.
-
-    Expects the input to already be the result of compress_by_downsplit_coarsening
-    (i.e., canonical coarsening + default downsplit to convergence).
-    Sweeps remaining multi-dimensional depths (max down to 0), then re-converges
-    with default downsplit.  Repeats until no further improvement.
-
-    This guarantees at least as many boxes are removed as default downsplit alone,
-    since the input already is the downsplit result and this only adds work.
-    """
-    total_discarded = 0.0
-    # Sweep remaining multi-dim depths and re-converge
-    while True:
-        descriptor = discretization.descriptor
-        node_levels = _compute_node_levels(descriptor)
-        multi_dim_depths: list[int] = sorted(
-            {
-                int(np.sum(node_levels[i]))
-                for i in range(len(descriptor))
-                if descriptor[i].count() >= 2
-            },
-            reverse=True,
-        )
-        if not multi_dim_depths:
-            break
-
-        old_count = len(discretization)
-        # Downsplit at each remaining multi-dim depth (max down to lowest)
-        discretization, coefficients, d1 = compress_by_downsplit_coarsening(
-            discretization,
-            [np.asarray(c, dtype=np.float64).copy() for c in coefficients],
-            coarsening_threshold,
-            _depth_schedule=multi_dim_depths,
-        )
-        total_discarded += d1
-        # Re-converge with default downsplit to exploit any new opportunities
-        discretization, coefficients, d2 = compress_by_downsplit_coarsening(
-            discretization,
-            [np.asarray(c, dtype=np.float64).copy() for c in coefficients],
-            coarsening_threshold,
-        )
-        total_discarded += d2
-        if len(discretization) >= old_count:
-            break
-
-    return discretization, coefficients, total_discarded
 
 
 if __name__ == "__main__":
