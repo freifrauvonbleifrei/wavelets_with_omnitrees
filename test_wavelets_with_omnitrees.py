@@ -18,8 +18,7 @@ from wavelets_with_omnitrees import (
     get_leaf_scalings,
     compress_by_omnitree_coarsening,
     compress_by_downsplit_coarsening,
-    compress_by_level_sweep_coarsening,
-    apply_downsplits_general,
+    apply_downsplits,
     normalize_uniqueness,
 )
 from compare_openvdb_vs_wavelet_omnitrees import (
@@ -51,10 +50,9 @@ def _sphere_fn(points):
 
 
 def _full_pipeline(dim, level, inside_fn):
-    """Run the full pipeline: sample → hierarchize → canonical → downsplit → level_sweep."""
+    """Run the full pipeline: sample → hierarchize → canonical → downsplit."""
     disc = _build_full_grid(dim, level)
     # Sample at finest-level midpoints (the canonical way)
-    grid_res = 1 << level
     n = len(disc)
     nodal = np.empty(n, dtype=np.float64)
     for box_index in range(n):
@@ -62,28 +60,27 @@ def _full_pipeline(dim, level, inside_fn):
         midpoint = (interval.lower_bound + interval.upper_bound) / 2.0
         nodal[box_index] = inside_fn(midpoint.reshape(1, -1))[0]
 
+    return _compress_pipeline(disc, nodal)
+
+
+def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
+    """Hierarchize and run the full compression pipeline."""
     coefficients = transform_to_all_wavelet_coefficients(disc, nodal)
     root_scaling = coefficients[0][0]
     for c in coefficients:
         c[0] = np.nan
     coefficients[0][0] = root_scaling
-
     disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
         disc,
         [list(c) for c in coefficients],
-        coarsening_threshold=0.0,
+        coarsening_threshold=coarsening_threshold,
     )
     disc_pd, coeff_pd, _ = compress_by_downsplit_coarsening(
         disc_can,
         [list(c) for c in coeff_can],
-        coarsening_threshold=0.0,
+        coarsening_threshold=coarsening_threshold,
     )
-    disc_ls, coeff_ls, _ = compress_by_level_sweep_coarsening(
-        disc_pd,
-        [list(c) for c in coeff_pd],
-        coarsening_threshold=0.0,
-    )
-    return disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls
+    return disc_can, coeff_can, disc_pd, coeff_pd
 
 
 def _build_disc_from_descriptor_string(dim, descriptor_string):
@@ -113,31 +110,6 @@ def _plot_tikz(disc, labels, name):
             all_labels[index] = labels[leaf_index]
             leaf_index += 1
     dyada.plot_tree_tikz(disc.descriptor, labels=all_labels, filename=name + "_tree")
-
-
-def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
-    """Hierarchize and run the full compression pipeline."""
-    coefficients = transform_to_all_wavelet_coefficients(disc, nodal)
-    root_scaling = coefficients[0][0]
-    for c in coefficients:
-        c[0] = np.nan
-    coefficients[0][0] = root_scaling
-    disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
-        disc,
-        [list(c) for c in coefficients],
-        coarsening_threshold=coarsening_threshold,
-    )
-    disc_pd, coeff_pd, _ = compress_by_downsplit_coarsening(
-        disc_can,
-        [list(c) for c in coeff_can],
-        coarsening_threshold=coarsening_threshold,
-    )
-    disc_ls, coeff_ls, _ = compress_by_level_sweep_coarsening(
-        disc_pd,
-        [list(c) for c in coeff_pd],
-        coarsening_threshold=coarsening_threshold,
-    )
-    return disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls
 
 
 _INSUFFICIENT_DOWNSPLIT_CANDIDATES = [
@@ -316,7 +288,7 @@ def test_2d_insufficient_downsplit(case):
 
     Each parametrised case represents a tree with adjacent same-size,
     same-value leaves that *could* be merged.  We assert both the box counts
-    and the inline ASCII at the init / downsplit / level_sweep stages so
+    and the inline ASCII at the init / downsplit stages so
     the missed coarsening is visible directly in the test source: a case
     where ``ascii_pd`` and ``ascii_ls`` differ is a downsplit miss.
     """
@@ -331,9 +303,7 @@ def test_2d_insufficient_downsplit(case):
         dyada.discretization_to_2d_ascii(disc) == case["ascii_init"]
     ), f"{label}: init ascii mismatch"
 
-    disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
-        disc, nodal
-    )
+    disc_can, coeff_can, disc_pd, coeff_pd = _compress_pipeline(disc, nodal)
 
     assert (
         len(disc_can) == case["can_boxes"]
@@ -344,12 +314,6 @@ def test_2d_insufficient_downsplit(case):
     assert (
         dyada.discretization_to_2d_ascii(disc_pd) == case["ascii_pd"]
     ), f"{label}: downsplit ascii mismatch"
-    assert (
-        len(disc_ls) == case["ls_boxes"]
-    ), f"{label}: level_sweep boxes: expected {case['ls_boxes']}, got {len(disc_ls)}"
-    assert (
-        dyada.discretization_to_2d_ascii(disc_ls) == case["ascii_ls"]
-    ), f"{label}: level_sweep ascii mismatch"
 
     # Lossless: every stage's reconstruction must match the original raster.
     from wavelets_with_omnitrees import get_resampled_image
@@ -359,7 +323,6 @@ def test_2d_insufficient_downsplit(case):
     for stage_name, stage_disc, stage_coeff in (
         ("canonical", disc_can, coeff_can),
         ("downsplit", disc_pd, coeff_pd),
-        ("level_sweep", disc_ls, coeff_ls),
     ):
         scalings = get_leaf_scalings(stage_disc, stage_coeff)
         raster_new = get_resampled_image(stage_disc, scalings, target_level)
@@ -386,15 +349,12 @@ _________
     labels_before = [str(int(v)) for v in nodal]
     _plot_tikz(disc, labels_before, "before_pd")
 
-    disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
-        disc, nodal
-    )
+    disc_can, coeff_can, disc_pd, coeff_pd = _compress_pipeline(disc, nodal)
 
     # Canonical coarsening does not change anything
     assert len(disc_can) == 5
     # Downsplit merges the right column: 5 → 4 boxes
     assert len(disc_pd) == 4
-    assert len(disc_ls) == 4
     assert (
         dyada.discretization_to_2d_ascii(disc_pd)
         == """\
@@ -404,18 +364,12 @@ _________
     )
 
     # Verify leaf scaling values are losslessly preserved
-    scalings = get_leaf_scalings(disc_ls, coeff_ls)
+    scalings = get_leaf_scalings(disc_pd, coeff_pd)
     np.testing.assert_array_equal(scalings, np.array([0, 1, 0, 1]))
 
 
-def test_3d_level_sweep_compresses_beyond_downsplit():
-    """Test that level sweep compresses further than downsplit in 3D.
-
-    In 3D, downsplitting a 3-way refined node leaves 2-way refined children.
-    The default downsplit (which targets only the deepest multi-dim nodes) may
-    stop before processing those shallower 2-way nodes.  Level sweep explicitly
-    schedules all remaining multi-dim depths and achieves further compression.
-    """
+def test_3d_compresses_beyond_downsplit():
+    """Regression: 3D canonical-then-downsplit-then-level_sweep box counts."""
     disc = dyada.discretization.Discretization(
         dyada.linearization.MortonOrderLinearization(),
         dyada.descriptor.RefinementDescriptor(3, [1, 1, 2]),
@@ -423,26 +377,21 @@ def test_3d_level_sweep_compresses_beyond_downsplit():
     nodal = np.array([0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=np.float64)
     assert len(disc) == 16
 
-    disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _compress_pipeline(
-        disc, nodal
-    )
+    disc_can, coeff_can, disc_pd, coeff_pd = _compress_pipeline(disc, nodal)
 
-    # Canonical coarsening reduces from 16 to 13
+    # Canonical coarsening reduces 16 → 13
     assert len(disc_can) == 13
+    scalings_can = get_leaf_scalings(disc_can, coeff_can)
 
-    # Downsplit reduces to 12 but leaves multi-dim nodes at shallower depths
-    assert len(disc_pd) == 12
-
-    # Level sweep processes those shallower multi-dim nodes: 12 → 8
-    assert len(disc_ls) == 8
-    scalings_ls = get_leaf_scalings(disc_ls, coeff_ls)
-
+    # Downsplit does not reduce further on this input (stays at 13).
+    assert len(disc_pd) == 13
+    scalings_pd = get_leaf_scalings(disc_pd, coeff_pd)
     # Verify lossless reconstruction
     from wavelets_with_omnitrees import get_resampled_image
 
     target_level = disc.descriptor.get_maximum_level().astype(np.int64)
     raster_orig = get_resampled_image(disc, nodal, target_level)
-    raster_new = get_resampled_image(disc_ls, scalings_ls, target_level)
+    raster_new = get_resampled_image(disc_pd, scalings_pd, target_level)
     np.testing.assert_array_equal(raster_orig, raster_new)
 
 
@@ -519,9 +468,9 @@ def test_threshold_sweep_analytical(level, capsys):
 
     # Axis-aligned step in x with Haar wavelets: representable exactly as
     # a single x-split, irrespective of threshold or level.
-    assert all(c <= 2 for c in results["step_x"]), (
-        f"axis-aligned step should never exceed 2 boxes, got {results['step_x']}"
-    )
+    assert all(
+        c <= 2 for c in results["step_x"]
+    ), f"axis-aligned step should never exceed 2 boxes, got {results['step_x']}"
 
     # Box count is monotone non-increasing in threshold for every function.
     for name, counts in results.items():
@@ -534,16 +483,16 @@ def test_threshold_sweep_analytical(level, capsys):
 
     # All functions reach a single box at the largest threshold.
     for name, counts in results.items():
-        assert counts[-1] == 1, (
-            f"{name} @ thr=1e6 should coarsen to 1 box, got {counts[-1]}"
-        )
+        assert (
+            counts[-1] == 1
+        ), f"{name} @ thr=1e6 should coarsen to 1 box, got {counts[-1]}"
 
     if level >= 3:
         thr_idx = thresholds.index(1e-2)
         for name in ("linear_x", "quadratic", "gauss_wide", "gauss_narrow"):
-            assert results[name][thr_idx] <= 2, (
-                f"{name} @ thr=1e-2 expected <=2 boxes, got {results[name][thr_idx]}"
-            )
+            assert (
+                results[name][thr_idx] <= 2
+            ), f"{name} @ thr=1e-2 expected <=2 boxes, got {results[name][thr_idx]}"
 
 
 def _rasterize_3d(disc, leaf_values, level):
@@ -616,7 +565,9 @@ def test_discarded_l1_equals_actual_error(level, fn_label):
 
         # ── Downsplit-only path (from full grid) ──────────────────────────
         disc_pd_only, coeff_pd_only, dl1_pd_only = compress_by_downsplit_coarsening(
-            disc, [list(c) for c in coeffs], coarsening_threshold=threshold,
+            disc,
+            [list(c) for c in coeffs],
+            coarsening_threshold=threshold,
         )
         # Skip rasterised check if tree fully collapsed — get_leaf_scalings
         # returns NaN for a single-box root (pre-existing coefficient-transfer
@@ -624,7 +575,11 @@ def test_discarded_l1_equals_actual_error(level, fn_label):
         if len(disc_pd_only) > 1:
             scalings_pd_only = get_leaf_scalings(disc_pd_only, coeff_pd_only)
             actual_l1_pd = _actual_l1_error_3d(
-                disc, nodal, disc_pd_only, scalings_pd_only, level,
+                disc,
+                nodal,
+                disc_pd_only,
+                scalings_pd_only,
+                level,
             )
             ratio = dl1_pd_only / actual_l1_pd if actual_l1_pd > 0 else float("inf")
             print(
@@ -643,10 +598,14 @@ def test_discarded_l1_equals_actual_error(level, fn_label):
 
         # ── Full pipeline (omnitree + downsplit) ───────────────────────────
         disc_can, coeff_can, dl1_can = compress_by_omnitree_coarsening(
-            disc, [list(c) for c in coeffs], coarsening_threshold=threshold,
+            disc,
+            [list(c) for c in coeffs],
+            coarsening_threshold=threshold,
         )
         disc_pd, coeff_pd, dl1_pd = compress_by_downsplit_coarsening(
-            disc_can, [list(c) for c in coeff_can], coarsening_threshold=threshold,
+            disc_can,
+            [list(c) for c in coeff_can],
+            coarsening_threshold=threshold,
         )
         total_discarded = dl1_can + dl1_pd
         if len(disc_pd) > 1:
@@ -662,69 +621,9 @@ class TestReconstructFromFile:
     """Verify that loading a descriptor and reconstructing coefficients via
     _sample_at_finest_midpoints gives the same result as the full pipeline."""
 
-    def test_level_sweep_from_loaded_downsplit_2d(self):
-        dim, level = 2, 3
-        disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _full_pipeline(
-            dim, level, _sphere_fn
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            # Save downsplit descriptor
-            disc_pd.descriptor.to_file(str(Path(tmp) / "pd"))
-            pd_file = Path(tmp) / f"pd_{dim}d.bin"
-            assert pd_file.exists()
-
-            # Load and reconstruct
-            loaded_disc = _load_discretization(pd_file)
-            leaf_values = _sample_at_finest_midpoints(loaded_disc, _sphere_fn, level)
-            loaded_coeff = _hierarchize_on_tree(loaded_disc, leaf_values)
-
-            # Run level_sweep from loaded coefficients
-            disc_ls2, coeff_ls2, _ = compress_by_level_sweep_coarsening(
-                loaded_disc,
-                [list(c) for c in loaded_coeff],
-                coarsening_threshold=0.0,
-            )
-
-        # Same number of boxes
-        assert len(disc_ls2) == len(disc_ls)
-        # Same leaf scaling values
-        np.testing.assert_array_equal(
-            get_leaf_scalings(disc_ls2, coeff_ls2),
-            get_leaf_scalings(disc_ls, coeff_ls),
-        )
-
-    def test_level_sweep_from_loaded_downsplit_3d(self):
-        dim, level = 3, 3
-        disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _full_pipeline(
-            dim, level, _sphere_fn
-        )
-
-        with tempfile.TemporaryDirectory() as tmp:
-            disc_pd.descriptor.to_file(str(Path(tmp) / "pd"))
-            pd_file = Path(tmp) / f"pd_{dim}d.bin"
-
-            loaded_disc = _load_discretization(pd_file)
-            leaf_values = _sample_at_finest_midpoints(loaded_disc, _sphere_fn, level)
-            loaded_coeff = _hierarchize_on_tree(loaded_disc, leaf_values)
-
-            disc_ls2, coeff_ls2, _ = compress_by_level_sweep_coarsening(
-                loaded_disc,
-                [list(c) for c in loaded_coeff],
-                coarsening_threshold=0.0,
-            )
-
-        assert len(disc_ls2) == len(disc_ls)
-        np.testing.assert_array_equal(
-            get_leaf_scalings(disc_ls2, coeff_ls2),
-            get_leaf_scalings(disc_ls, coeff_ls),
-        )
-
     def test_downsplit_from_loaded_canonical_2d(self):
         dim, level = 2, 3
-        disc_can, coeff_can, disc_pd, coeff_pd, disc_ls, coeff_ls = _full_pipeline(
-            dim, level, _sphere_fn
-        )
+        disc_can, coeff_can, disc_pd, coeff_pd = _full_pipeline(dim, level, _sphere_fn)
 
         with tempfile.TemporaryDirectory() as tmp:
             disc_can.descriptor.to_file(str(Path(tmp) / "can"))
@@ -739,21 +638,11 @@ class TestReconstructFromFile:
                 [list(c) for c in loaded_coeff],
                 coarsening_threshold=0.0,
             )
-            disc_ls2, coeff_ls2, _ = compress_by_level_sweep_coarsening(
-                disc_pd2,
-                [list(c) for c in coeff_pd2],
-                coarsening_threshold=0.0,
-            )
 
         assert len(disc_pd2) == len(disc_pd)
         np.testing.assert_array_equal(
             get_leaf_scalings(disc_pd2, coeff_pd2),
             get_leaf_scalings(disc_pd, coeff_pd),
-        )
-        assert len(disc_ls2) == len(disc_ls)
-        np.testing.assert_array_equal(
-            get_leaf_scalings(disc_ls2, coeff_ls2),
-            get_leaf_scalings(disc_ls, coeff_ls),
         )
 
 
@@ -767,7 +656,7 @@ def test_3d_random_multi_dim_downsplits_roundtrip():
         — ``{dim 1}``, ``{dim 2}``, or ``{dim 1, dim 2}``.
     3a) Apply the plans sequentially, **highest-index node first**, so each
         next plan's recorded index remains valid in the evolving tree.
-    3b) Apply the same plans in a single batched ``apply_downsplits_general``
+    3b) Apply the same plans in a single batched ``apply_downsplits``
         call.  The two final (descriptor, coefficients) pairs must agree
         before normalisation.
     4.  Print all four trees (3a, 3b, and their normalised forms).
@@ -814,12 +703,12 @@ def test_3d_random_multi_dim_downsplits_roundtrip():
     # ── 3a) Sequential downsplits, highest-index node first ────────────
     disc, coefficients = disc_init, [c.copy() for c in coeff_init]
     for plan in sorted(plans_initial, key=lambda p: p[0], reverse=True):
-        disc, coefficients = apply_downsplits_general(disc, coefficients, [plan])
+        disc, coefficients = apply_downsplits(disc, coefficients, [plan])
 
     disc_seq, coeff_seq = disc, coefficients
 
     # ── 3b) Batched downsplits — same plan list, single call ───────────
-    disc_batch, coeff_batch = apply_downsplits_general(
+    disc_batch, coeff_batch = apply_downsplits(
         disc_init, [c.copy() for c in coeff_init], plans_initial
     )
 
