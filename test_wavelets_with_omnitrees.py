@@ -20,6 +20,8 @@ from wavelets_with_omnitrees import (
     compress_by_downsplit_coarsening,
     apply_downsplits,
     normalize_uniqueness,
+    downsplit_node_coefficients,
+    reverse_downsplit_coefficients,
 )
 from compare_openvdb_vs_wavelet_omnitrees import (
     _sample_at_finest_midpoints,
@@ -644,6 +646,54 @@ class TestReconstructFromFile:
             get_leaf_scalings(disc_pd2, coeff_pd2),
             get_leaf_scalings(disc_pd, coeff_pd),
         )
+
+
+@pytest.mark.parametrize(
+    "push_str",
+    ["100", "010", "001", "110", "101", "011"],
+)
+def test_downsplit_then_reverse_roundtrip_3d(push_str):
+    """Single 3D 111-node: ``downsplit_node_coefficients`` then
+    ``reverse_downsplit_coefficients`` must return the original wavelet
+    coefficients for every non-empty ``push_dims`` subset.
+
+    This is the minimal reproducer for the NaN leakage seen in
+    ``test_3d_random_multi_dim_downsplits_roundtrip``: the merged coefficients
+    end up NaN in exactly the wavelet slots along the pushed dimensions,
+    regardless of how many downsplits happen above — a single forward/reverse
+    cycle suffices to exhibit the bug.
+    """
+    ref111 = ba.bitarray("111")
+    push = ba.bitarray(push_str)
+
+    c = np.array([np.nan, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], dtype=np.float64)
+
+    new_parent, intermediates = downsplit_node_coefficients(c, ref111, push)
+
+    parent_ref = ref111 & ~push
+    children_refs = [push.copy() for _ in intermediates]
+    children = []
+    for it in intermediates:
+        tmp = np.asarray(it, dtype=np.float64).copy()
+        tmp[0] = np.nan
+        children.append(tmp)
+
+    merged, _ = reverse_downsplit_coefficients(
+        new_parent,
+        parent_ref,
+        children,
+        children_refs,
+        absorbed_dims=push,
+    )
+
+    np.testing.assert_allclose(
+        merged,
+        c,
+        rtol=1e-12,
+        atol=1e-12,
+        equal_nan=True,
+        err_msg=f"forward/reverse downsplit mismatch for push={push_str}",
+    )
 
 
 def test_3d_random_multi_dim_downsplits_roundtrip():
