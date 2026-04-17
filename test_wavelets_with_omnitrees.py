@@ -186,16 +186,16 @@ _____
 |_|_|""",
     },
     # ── R: canonical input (4×4) — bot-left checker + 3 zero quadrants ──
-    # Downsplit cascades the root `11` but never produces this restructuring;
-    # level-sweep finds it (optimum)
+    # Downsplit now reaches the level-sweep optimum (6 boxes) after the
+    # reverse_downsplit_coefficients fix unblocked the merge; ascii_pd and
+    # ascii_ls are now identical.
     {
         "label": "R_canonical_quadrant_checker",
         "descriptor": "11 11 00 00 00 00 00 00 00",
         "values": [0, 1, 1, 0, 0, 0, 0],
         "init_boxes": 7,
         "can_boxes": 7,
-        "pd_boxes": 7,
-        "ls_boxes": 6,
+        "pd_boxes": 6,
         "ascii_init": """\
 _________
 |   |   |
@@ -203,12 +203,6 @@ _________
 |_|_|   |
 |_|_|___|""",
         "ascii_pd": """\
-_________
-|   |   |
-|___|___|
-|_|_|   |
-|_|_|___|""",
-        "ascii_ls": """\
 _________
 |   |   |
 |___|   |
@@ -227,8 +221,7 @@ _________
         "values": [0, 1, 1, 0, 1, 0, 0, 0],
         "init_boxes": 8,
         "can_boxes": 8,
-        "pd_boxes": 8,
-        "ls_boxes": 7,
+        "pd_boxes": 7,
         "ascii_init": """\
 _________
 |   |   |
@@ -236,12 +229,6 @@ _________
 |_|_|___|
 |_|_|___|""",
         "ascii_pd": """\
-_________
-|   |   |
-|___|___|
-|_|_|___|
-|_|_|___|""",
-        "ascii_ls": """\
 _________
 |       |
 |_______|
