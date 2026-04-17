@@ -280,21 +280,6 @@ def get_numbers_with_ith_bit_set(
     return tuple(j for j in range(1 << bit_length) if j & mask)
 
 
-def get_set_bitarray_indices(bits: ba.bitarray) -> set[int]:
-    return {i for i, bit in enumerate(reversed(bits)) if bit}
-
-
-@lru_cache(maxsize=None)
-def get_one_d_refinement(
-    i_set_bit_index: int, bit_length: int, reverse=False
-) -> ba.bitarray:
-    one_d_refinement = ba.bitarray("0" * bit_length)
-    one_d_refinement[i_set_bit_index] = 1
-    if reverse:
-        one_d_refinement.reverse()
-    return one_d_refinement
-
-
 def morton_to_multidim(
     morton_index: int, num_dimensions: int = 2, level: int = 6
 ) -> tuple[int, ...]:
@@ -525,10 +510,11 @@ def downsplit_single_node_coefficients(
     one dimension; preserved for backward compatibility.  Each intermediate
     is a length-2 ``[scaling, detail_d]`` array.
     """
-    push_dims = ba.bitarray(len(old_ref))
-    push_dims.setall(0)
-    push_dims[down_dim] = 1
-    return downsplit_node_coefficients_general(old_coeffs, old_ref, push_dims)
+    return downsplit_node_coefficients_general(
+        old_coeffs,
+        old_ref,
+        ba.bitarray(dyada.linearization.indices_to_bitmask([down_dim], len(old_ref))),
+    )
 
 
 def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
@@ -538,14 +524,9 @@ def _subset_index_in_ref(global_dims_set: ba.bitarray, ref: ba.bitarray) -> int:
     return the integer index into the coefficient array (of length 2^|ref|) that
     corresponds to that subset.
     """
-    ref_dims = get_refined_dimensions_desc(ref)  # local ordering of dims in ref
-    k = ref.count()
-    bits = ba.bitarray(k)
-    bits.setall(0)
-    for local_i, global_dim in enumerate(ref_dims):
-        if global_dims_set[global_dim]:
-            bits[local_i] = 1
-    return bitarray.util.ba2int(bits)
+    return dyada.linearization.MortonOrderLinearization.get_index_from_binary_position(
+        global_dims_set, [], [ref]
+    )
 
 
 def reverse_downsplit_coefficients(
@@ -582,54 +563,36 @@ def reverse_downsplit_coefficients(
         per_child_ref = [children_refs] * n_parent_children
     else:
         per_child_ref = children_refs
-
     assert len(children_coeffs) == n_parent_children
-    absorbed_dims_list = get_refined_dimensions_desc(absorbed_dims)
 
     # ── Merged parent coefficients ──────────────────────────────────────────
-    merged_coeffs = np.full(1 << k_merged, np.nan, dtype=np.float64)
-    parent_dims_list = get_refined_dimensions_desc(parent_ref)
+    raw_fibers = np.zeros((n_parent_children, n_absorbed_slots), dtype=np.float64)
+    for T2 in range(n_absorbed_slots):
+        t2_global = _subset_local_to_global_bits(T2, absorbed_dims, ndim)
+        for j in range(n_parent_children):
+            idx = _subset_index_in_ref(t2_global, per_child_ref[j])
+            raw_fibers[j, T2] = float(children_coeffs[j][idx])
 
-    for t2_int in range(n_absorbed_slots):
-        # Build T₂ as a global-dim bitarray
-        t2_bits_local = bitarray.util.int2ba(t2_int, length=k_absorbed)
-        t2_global = ba.bitarray(ndim)
-        t2_global.setall(0)
-        for local_i, global_dim in enumerate(absorbed_dims_list):
-            if t2_bits_local[local_i]:
-                t2_global[global_dim] = 1
+    fibers = hierarchization_matrix(k_parent) @ raw_fibers
+    fibers[:, 0] = np.asarray(parent_coeffs, dtype=np.float64)
 
-        if t2_int == 0:
-            # T₂ = ∅: fiber is the parent's existing coefficients
-            fiber = list(parent_coeffs)
-        else:
-            # Collect w_{T₂} from each child, using that child's own ref
-            raw_fiber = []
-            for j in range(n_parent_children):
-                child_t2_index = _subset_index_in_ref(t2_global, per_child_ref[j])
-                raw_fiber.append(float(children_coeffs[j][child_t2_index]))
-            # Forward Haar (hierarchize)
-            fiber = list(
-                np.matmul(hierarchization_matrix(k_parent), raw_fiber, dtype=np.float64)
-            )
+    # Re-permute fibers (parent_ref local order, then absorbed local order)
+    # into merged_ref's local axis order, then flatten — same reshape/transpose
+    # pattern used by the ``_general`` helpers.
+    absorbed_local, parent_local = _local_split_indices(merged_ref, absorbed_dims)
+    perm = parent_local + absorbed_local
+    inv_perm = [0] * k_merged
+    for fibers_axis, merged_pos in enumerate(perm):
+        inv_perm[merged_pos] = fibers_axis
 
-        # Place fiber entries into merged_coeffs
-        for t1_int in range(1 << k_parent if k_parent > 0 else 1):
-            t1_bits_local = (
-                bitarray.util.int2ba(t1_int, length=k_parent)
-                if k_parent > 0
-                else ba.bitarray()
-            )
-            t1_global = ba.bitarray(ndim)
-            t1_global.setall(0)
-            for local_i, global_dim in enumerate(parent_dims_list):
-                if t1_bits_local[local_i]:
-                    t1_global[global_dim] = 1
-
-            # T = T₁ ∪ T₂ in merged ref
-            t_global = t1_global | t2_global
-            merged_index = _subset_index_in_ref(t_global, merged_ref)
-            merged_coeffs[merged_index] = fiber[t1_int]
+    if k_merged == 0:
+        merged_coeffs = np.array([fibers[0, 0]], dtype=np.float64)
+    else:
+        merged_coeffs = (
+            fibers.reshape((2,) * k_parent + (2,) * k_absorbed)
+            .transpose(inv_perm)
+            .reshape(1 << k_merged)
+        )
 
     # ── Split child coefficient arrays ──────────────────────────────────────
     # For each child mⱼ, split into 2^|D| sub-children by applying |D|-dim
@@ -638,52 +601,32 @@ def reverse_downsplit_coefficients(
 
     split_children: list[list[np.ndarray]] = []
     for j in range(n_parent_children):
-        child_c = children_coeffs[j]
+        child_c = np.asarray(children_coeffs[j], dtype=np.float64)
         child_ref_j = per_child_ref[j]
-        remaining_child_ref = child_ref_j.copy()
-        for d in range(ndim):
-            if absorbed_dims[d]:
-                remaining_child_ref[d] = 0
-        k_remaining = remaining_child_ref.count()
-        n_remaining_slots = 1 << k_remaining if k_remaining > 0 else 1
-        remaining_dims_list = get_refined_dimensions_desc(remaining_child_ref)
+        k_c = child_ref_j.count()
+        remaining_child_ref = child_ref_j & ~absorbed_dims
+        n_remaining_slots = (
+            1 << remaining_child_ref.count() if remaining_child_ref.count() > 0 else 1
+        )
 
-        # Build a (2^|D| × n_remaining_slots) tensor
-        tensor = np.zeros((n_absorbed_slots, n_remaining_slots), dtype=np.float64)
-        for td_int in range(n_absorbed_slots):
-            td_bits_local = bitarray.util.int2ba(td_int, length=k_absorbed)
-            td_global = ba.bitarray(ndim)
-            td_global.setall(0)
-            for local_i, global_dim in enumerate(absorbed_dims_list):
-                if td_bits_local[local_i]:
-                    td_global[global_dim] = 1
+        if k_c == 0:
+            tensor = child_c.reshape(1, 1)
+        else:
+            absorbed_local, remaining_local = _local_split_indices(
+                child_ref_j, absorbed_dims
+            )
+            tensor = (
+                child_c.reshape((2,) * k_c)
+                .transpose(absorbed_local + remaining_local)
+                .reshape(n_absorbed_slots, n_remaining_slots)
+            )
 
-            for tr_int in range(n_remaining_slots):
-                tr_bits_local = (
-                    bitarray.util.int2ba(tr_int, length=k_remaining)
-                    if k_remaining > 0
-                    else ba.bitarray()
-                )
-                tr_global = ba.bitarray(ndim)
-                tr_global.setall(0)
-                for local_i, global_dim in enumerate(remaining_dims_list):
-                    if tr_bits_local[local_i]:
-                        tr_global[global_dim] = 1
-
-                t_global = td_global | tr_global
-                child_index = _subset_index_in_ref(t_global, child_ref_j)
-                tensor[td_int, tr_int] = float(child_c[child_index])
-
-        # Apply inverse Haar in D-dims
-        sub_values = np.matmul(nod_matrix, tensor, dtype=np.float64)
-
+        sub_values = nod_matrix @ tensor  # (n_absorbed, n_remaining)
         sub_children_for_j: list[np.ndarray] = []
         for d_int in range(n_absorbed_slots):
-            sub_coeffs = sub_values[d_int].astype(np.float64, copy=True)
-            # Restore NaN at scaling slot
-            sub_coeffs[0] = np.nan
-            sub_children_for_j.append(sub_coeffs)
-
+            arr = sub_values[d_int].copy()
+            arr[0] = np.nan  # restore NaN-by-convention at the scaling slot
+            sub_children_for_j.append(arr)
         split_children.append(sub_children_for_j)
 
     return merged_coeffs, split_children
