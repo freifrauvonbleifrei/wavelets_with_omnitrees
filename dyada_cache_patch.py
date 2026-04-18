@@ -12,6 +12,7 @@ Usage::
 
 import bisect
 import numpy as np
+import bitarray as ba
 
 from dyada.descriptor import RefinementDescriptor, Branch, LevelCounter
 from dyada.linearization import location_code_from_branch
@@ -94,6 +95,141 @@ def _cached_get_children(
         if parent_cache[i] == parent_index:
             children.append(i)
     return children
+
+
+# ── parent / siblings lookup via parent cache ───────────────────────────────
+
+_original_get_siblings = RefinementDescriptor.get_siblings
+
+
+def _get_parent_by_index(
+    self: RefinementDescriptor, hierarchical_index: int
+) -> int:
+    """O(1) parent lookup from the parent cache.  Returns -1 for the root.
+
+    Unlike ``RefinementDescriptor.get_parent`` — which takes a ``Branch`` and
+    walks the descriptor to locate the matching parent — this variant operates
+    on hierarchical index directly and avoids any tree walk.
+    """
+    _ensure_parent_cache(self)
+    return self._parent_cache[hierarchical_index]
+
+
+def _cached_get_siblings(
+    self: RefinementDescriptor, hierarchical_index: int, branch_to_index=None
+) -> list[int]:
+    """O(num_children) siblings lookup via the parent cache.
+
+    Bypasses the ``get_parent → get_oldest_sibling → skip_to_next_neighbor``
+    chain, which on a sphere-at-L5 run accounts for 15 s of self time in
+    ``get_parent`` alone.  The sibling set is exactly
+    ``get_children(parent_of(hierarchical_index))``.
+    """
+    _ensure_parent_cache(self)
+    parent = self._parent_cache[hierarchical_index]
+    if parent == -1:
+        return [hierarchical_index]  # root has no siblings
+    return _cached_get_children(self, parent)
+
+
+# ── subtree-size cache + tracked iterator ────────────────────────────────────
+
+_original_iter = RefinementDescriptor.__iter__
+_original_skip = RefinementDescriptor.skip_to_next_neighbor
+
+
+def _ensure_subtree_size_cache(self: RefinementDescriptor) -> None:
+    """Derive ``_subtree_size[i]`` and ``_box_count[i]`` from the parent cache.
+
+    ``subtree_size[i]`` is the number of DFS-preorder nodes starting at ``i``
+    before the next node with parent index ``<= parent_cache[i]`` — that is,
+    the range continues for as long as we're deeper than ``i``'s parent.
+    Iterating right-to-left lets us jump past already-measured child subtrees
+    in O(1), making the whole build O(n).
+    """
+    if hasattr(self, "_subtree_size"):
+        return
+    _ensure_parent_cache(self)
+    n = len(self)
+    parent_cache = self._parent_cache
+    d_zeros = self.d_zeros
+    subtree_size = [0] * n
+    box_count = [0] * n
+    for i in range(n - 1, -1, -1):
+        if self[i] == d_zeros:
+            subtree_size[i] = 1
+            box_count[i] = 1
+            continue
+        target = parent_cache[i]
+        j = i + 1
+        box = 0
+        while j < n and parent_cache[j] > target:
+            box += box_count[j]
+            j += subtree_size[j]  # jump past child's already-measured subtree
+        subtree_size[i] = j - i
+        box_count[i] = box
+    self._subtree_size = subtree_size
+    self._box_count = box_count
+
+
+class _TrackedIter:
+    """Iterator over a RefinementDescriptor that exposes its current position.
+
+    Mirrors :py:meth:`RefinementDescriptor.__iter__` for both ``__debug__``
+    modes.  The tracked ``_position`` is the index of the *next* node to yield,
+    so the item most recently returned by ``__next__`` lives at ``_position-1``.
+    """
+
+    __slots__ = ("_descriptor", "_position", "_end", "_nd")
+
+    def __init__(self, descriptor: RefinementDescriptor, start: int = 0):
+        self._descriptor = descriptor
+        self._position = start
+        self._end = len(descriptor)
+        self._nd = descriptor._num_dimensions
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._position >= self._end:
+            raise StopIteration
+        j = self._position * self._nd
+        data = self._descriptor.get_data()[j : j + self._nd]
+        self._position += 1
+        if __debug__:
+            return ba.frozenbitarray(data)
+        return data
+
+    def _advance(self, n: int) -> None:
+        """O(1) skip forward by ``n`` nodes without yielding them."""
+        self._position += n
+
+
+def _tracked_iter(self: RefinementDescriptor, start: int = 0):
+    return _TrackedIter(self, start)
+
+
+def _cached_skip(
+    self: RefinementDescriptor,
+    descriptor_iterator,
+    current_refinement: ba.frozenbitarray,
+) -> tuple[int, int]:
+    """Cached replacement for ``skip_to_next_neighbor``.
+
+    ``current_refinement`` was just yielded by ``descriptor_iterator``, so if
+    the iterator is a :class:`_TrackedIter` we know the subtree we must skip
+    starts at position ``iterator._position - 1``.  Pull the precomputed size
+    from the cache and advance in O(1).  Otherwise fall back to the original.
+    """
+    if isinstance(descriptor_iterator, _TrackedIter):
+        _ensure_subtree_size_cache(self)
+        pos = descriptor_iterator._position - 1
+        size = self._subtree_size[pos]
+        boxes = self._box_count[pos]
+        descriptor_iterator._advance(size - 1)
+        return boxes, size
+    return _original_skip(self, descriptor_iterator, current_refinement)
 
 
 # ── branch cache (on-demand, nearest-hint) ───────────────────────────────────
@@ -255,6 +391,10 @@ def install():
     RefinementDescriptor.get_branch = _cached_get_branch
     RefinementDescriptor.get_ancestry_by_index = _get_ancestry_by_index
     RefinementDescriptor.get_children = _cached_get_children
+    RefinementDescriptor.get_siblings = _cached_get_siblings
+    RefinementDescriptor.get_parent_by_index = _get_parent_by_index
+    RefinementDescriptor.__iter__ = _tracked_iter
+    RefinementDescriptor.skip_to_next_neighbor = _cached_skip
     _ab_mod._is_old_index_now_at_or_containing_location_code = _patched_is_old
     _AncestryMappingState.__init__ = _patched_mapping_state_init
     _AncestryBranch.__init__ = _patched_ab_init
@@ -268,8 +408,13 @@ def uninstall():
         return
     RefinementDescriptor.get_branch = _original_get_branch
     RefinementDescriptor.get_children = _original_get_children
+    RefinementDescriptor.get_siblings = _original_get_siblings
+    RefinementDescriptor.__iter__ = _original_iter
+    RefinementDescriptor.skip_to_next_neighbor = _original_skip
     if hasattr(RefinementDescriptor, "get_ancestry_by_index"):
         delattr(RefinementDescriptor, "get_ancestry_by_index")
+    if hasattr(RefinementDescriptor, "get_parent_by_index"):
+        delattr(RefinementDescriptor, "get_parent_by_index")
     _ab_mod._is_old_index_now_at_or_containing_location_code = _original_is_old
     _AncestryMappingState.__init__ = _original_mapping_state_init
     _AncestryBranch.__init__ = _original_ab_init
