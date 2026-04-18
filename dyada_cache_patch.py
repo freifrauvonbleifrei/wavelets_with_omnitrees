@@ -97,14 +97,63 @@ def _cached_get_children(
     return children
 
 
+# ── level cache (derived from parent cache) ─────────────────────────────────
+#
+# Profiling shows populate_queue calling get_level(idx, False) 16 K times per
+# L5-analytic run, each triggering a full branch walk (52 K cache misses total
+# cost 215 s cum).  Level is purely structural — the sum of ancestor refs
+# excluding the root — so one O(n) forward pass populates every index.
+
+_original_get_level = RefinementDescriptor.get_level
+
+
+def _ensure_level_cache(self: RefinementDescriptor) -> None:
+    """Derive ``_level_cache[i]`` from the parent cache in O(n).
+
+    Replicates ``get_level_from_branch``'s semantics: ``level[i]`` is the sum
+    of refinement bits from every ancestor of ``i``.  ``Branch.__init__``
+    seeds a zero-ref sentinel twig, then appends one twig per ancestor — so
+    skipping the sentinel and summing the rest gives exactly what we build
+    here by ``level[child] = level[parent] + ref(parent)`` starting from the
+    root at ``[0, ...]``.
+    """
+    if hasattr(self, "_level_cache"):
+        return
+    _ensure_parent_cache(self)
+    n = len(self)
+    nd = self._num_dimensions
+    parent_cache = self._parent_cache
+    level_cache: list = [None] * n
+    level_cache[0] = np.zeros(nd, dtype=np.int8)
+    from dyada.descriptor import int8_ndarray_from_iterable
+
+    for i in range(1, n):
+        p = parent_cache[i]
+        level_cache[i] = level_cache[p] + int8_ndarray_from_iterable(self[p])
+    self._level_cache = level_cache
+
+
+def _cached_get_level(
+    self: RefinementDescriptor, index: int, is_box_index: bool = True
+) -> np.ndarray:
+    """Cached replacement for ``get_level``.
+
+    Only the ``is_box_index=False`` call pattern (used by ``populate_queue``)
+    is cached — that's the 16 K-call hot path.  Box-indexed callers fall
+    through to the original so we don't need a separate box→hierarchical map.
+    """
+    if is_box_index:
+        return _original_get_level(self, index, is_box_index)
+    _ensure_level_cache(self)
+    return self._level_cache[index].copy()
+
+
 # ── parent / siblings lookup via parent cache ───────────────────────────────
 
 _original_get_siblings = RefinementDescriptor.get_siblings
 
 
-def _get_parent_by_index(
-    self: RefinementDescriptor, hierarchical_index: int
-) -> int:
+def _get_parent_by_index(self: RefinementDescriptor, hierarchical_index: int) -> int:
     """O(1) parent lookup from the parent cache.  Returns -1 for the root.
 
     Unlike ``RefinementDescriptor.get_parent`` — which takes a ``Branch`` and
@@ -393,6 +442,7 @@ def install():
     RefinementDescriptor.get_children = _cached_get_children
     RefinementDescriptor.get_siblings = _cached_get_siblings
     RefinementDescriptor.get_parent_by_index = _get_parent_by_index
+    RefinementDescriptor.get_level = _cached_get_level
     RefinementDescriptor.__iter__ = _tracked_iter
     RefinementDescriptor.skip_to_next_neighbor = _cached_skip
     _ab_mod._is_old_index_now_at_or_containing_location_code = _patched_is_old
@@ -409,6 +459,7 @@ def uninstall():
     RefinementDescriptor.get_branch = _original_get_branch
     RefinementDescriptor.get_children = _original_get_children
     RefinementDescriptor.get_siblings = _original_get_siblings
+    RefinementDescriptor.get_level = _original_get_level
     RefinementDescriptor.__iter__ = _original_iter
     RefinementDescriptor.skip_to_next_neighbor = _original_skip
     if hasattr(RefinementDescriptor, "get_ancestry_by_index"):
