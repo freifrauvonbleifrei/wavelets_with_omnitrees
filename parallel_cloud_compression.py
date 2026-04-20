@@ -27,11 +27,8 @@ import dyada.linearization
 from dyada.descriptor_builder import compose_grid
 from dyada.linearization import flat_to_coord
 
-try:
-    from dyada_cache_patch import install as _install_cache
-    _install_cache()
-except ImportError:
-    pass
+from dyada_cache_patch import install as _install_cache
+_install_cache()
 
 from compare_cloud import (
     read_vdb_grid, vdb_grid_extent, levels_from_extent, omnitree_from_vdb,
@@ -56,38 +53,31 @@ def partition_paths(work_dir, part_idx):
 _WORKER_GRID = None  # per-process cache of the VDB grid (set by _init_worker)
 
 
-def _init_worker(vdb_path, grid_name):
-    """Pool initializer: load the VDB once per worker process and cache it."""
-    global _WORKER_GRID
+def _init_worker():
+    """Pool initializer: install the dyada cache patch in each worker.
+
+    The VDB grid itself is inherited from the parent process via fork's
+    copy-on-write semantics — no per-worker file I/O needed.
+    """
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        from dyada_cache_patch import install
-        install()
-    except ImportError:
-        pass
-    from compare_cloud import read_vdb_grid
-    _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
+    _install_cache()
 
 
 def compress_partition(args_tuple):
     """Compress a single sub-region of the VDB grid.  Runs in a worker process.
 
-    Reuses the per-worker VDB grid loaded by _init_worker to avoid re-reading
-    the (potentially multi-GB) VDB file on every task.
+    The VDB grid is inherited from the parent process via fork (copy-on-write),
+    stored in the module-level ``_WORKER_GRID``.  Workers only read the grid
+    so the OS pages stay shared — one physical copy for all workers.
     """
     (part_idx, vdb_path, grid_name, sub_bbox_min, sub_levels,
      threshold, work_dir) = args_tuple
 
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        from dyada_cache_patch import install
-        install()
-    except ImportError:
-        pass
 
-    from compare_cloud import read_vdb_grid, omnitree_from_vdb
+    from compare_cloud import omnitree_from_vdb
     from wavelets_with_omnitrees import (
         transform_to_all_wavelet_coefficients,
         get_leaf_scalings,
@@ -95,12 +85,11 @@ def compress_partition(args_tuple):
     )
     import numpy as np
 
-    global _WORKER_GRID
-    if _WORKER_GRID is None:
-        # Happens when compress_partition is called directly (e.g. serial run)
-        # without the pool initializer.
-        _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
     grid = _WORKER_GRID
+    assert grid is not None, (
+        "compress_partition requires _WORKER_GRID to be set in the parent "
+        "process before forking the worker pool"
+    )
     disc, vals = omnitree_from_vdb(grid, np.array(sub_bbox_min), np.array(sub_levels))
 
     n_initial = len(disc.descriptor)
@@ -161,6 +150,8 @@ def main():
     parser.add_argument("--max-level", type=int, default=6)
     parser.add_argument("--skip-serial", action="store_true",
                         help="Skip the serial baseline (faster for testing)")
+    parser.add_argument("--only-subs", action="store_true",
+                        help="run only the parallel subs, not the joint descriptor")
     parser.add_argument("--split-levels", type=int, nargs="+", default=None,
                         help="Top-level splits per dim.  Pass a single int to apply "
                         "the same level to all dims (e.g. 3 -> 8^3=512 partitions), "
@@ -237,7 +228,10 @@ def main():
     print(f"\nPartitioned into {n_partitions} sub-regions "
           f"(split_levels={grid_levels}, grid={grid_shape}, sub_levels={sub_levels})")
     print(f"Resume cache in {work_dir}/: {len(cached)} cached, {len(pending)} pending")
-    del grid
+
+    # Keep the grid alive so forked workers inherit it via copy-on-write.
+    global _WORKER_GRID
+    _WORKER_GRID = grid
 
     # ── Serial baseline (optional, skip with --skip-serial) ──────────────
     t_serial = None
@@ -274,7 +268,6 @@ def main():
         with ProcessPoolExecutor(
             max_workers=args.workers,
             initializer=_init_worker,
-            initargs=(vdb_path, args.grid_name),
         ) as pool:
             futures = {pool.submit(compress_partition, a): a[0] for a in pending}
             for future in as_completed(futures):
@@ -283,6 +276,8 @@ def main():
                 print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes, "
                       f"{stats['compressed_boxes']:7d} boxes "
                       f"(from {stats['initial_nodes']})")
+    if args.only_subs:
+        return
 
     # Load all partitions (cached + freshly computed) from disk for compose.
     child_descriptors = [None] * n_partitions
