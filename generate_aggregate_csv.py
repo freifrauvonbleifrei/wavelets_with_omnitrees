@@ -86,6 +86,14 @@ def main():
         f"levels {list(levels)})"
     )
 
+    for col, fname in [
+        ("can_boxes", "coeff_canonical.csv"),
+        ("ds_boxes", "coeff_downsplit.csv"),
+        ("vdb_total_coefficients", "coeff_openvdb.csv"),
+    ]:
+        p = write_raw_csv(df, col, fname, args.outdir)
+        print(f"Wrote {p}")
+
     p = write_aggregate_csv(df, args.outdir)
     print(f"Wrote {p}")
 

@@ -45,11 +45,6 @@ COLUMNS = [
     "ds_boxes",
     "ds_topo_bits",
     "ds_ref_counts",
-    # Level sweep coarsening (optional)
-    "ls_nodes",
-    "ls_boxes",
-    "ls_topo_bits",
-    "ls_ref_counts",
     # OpenVDB (optional)
     "vdb_topo_bits",
     "vdb_topo_bytes",
@@ -65,11 +60,17 @@ COLUMNS = [
     # Compressed omnitree sizes (canonical)
     "can_raw_total_bytes",
     "can_blosc2_total_bytes",
-    "can_lz4_total_bytes",
+    "can_desc_raw_bytes",
+    "can_desc_blosc2_bytes",
+    "can_coeffs_raw_bytes",
+    "can_coeffs_blosc2_bytes",
     # Compressed omnitree sizes (downsplit)
     "ds_raw_total_bytes",
     "ds_blosc2_total_bytes",
-    "ds_lz4_total_bytes",
+    "ds_desc_raw_bytes",
+    "ds_desc_blosc2_bytes",
+    "ds_coeffs_raw_bytes",
+    "ds_coeffs_blosc2_bytes",
 ]
 
 
@@ -258,11 +259,8 @@ def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
       - {base}_coeffs.bin           (raw packed 1-bit coefficients)
       - {base}_3d.bin.blosc2        (blosc2-compressed descriptor)
       - {base}_coeffs.bin.blosc2    (blosc2-compressed coefficients)
-      - {base}_3d.bin.lz4           (lz4-compressed descriptor)
-      - {base}_coeffs.bin.lz4       (lz4-compressed coefficients)
 
-    Returns dict with keys:
-      raw_total_bytes, blosc2_total_bytes, lz4_total_bytes
+    Returns dict with raw / blosc2 descriptor, coefficient, and total bytes.
     """
     import bitarray as ba
 
@@ -295,8 +293,9 @@ def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
         "raw_descriptor_bytes": len(desc_data),
         "raw_coeffs_bytes": len(coeffs_data),
         "raw_total_bytes": len(desc_data) + len(coeffs_data),
+        "blosc2_descriptor_bytes": float("nan"),
+        "blosc2_coeffs_bytes": float("nan"),
         "blosc2_total_bytes": float("nan"),
-        "lz4_total_bytes": float("nan"),
     }
 
     # Blosc2 compression (optional)
@@ -308,20 +307,9 @@ def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
             f.write(desc_blosc2)
         with open(coeffs_path + ".blosc2", "wb") as f:
             f.write(coeffs_blosc2)
+        result["blosc2_descriptor_bytes"] = len(desc_blosc2)
+        result["blosc2_coeffs_bytes"] = len(coeffs_blosc2)
         result["blosc2_total_bytes"] = len(desc_blosc2) + len(coeffs_blosc2)
-    except ImportError:
-        pass
-
-    # LZ4 compression (optional)
-    try:
-        import lz4.frame
-        desc_lz4 = lz4.frame.compress(desc_data)
-        coeffs_lz4 = lz4.frame.compress(coeffs_data)
-        with open(descriptor_path + ".lz4", "wb") as f:
-            f.write(desc_lz4)
-        with open(coeffs_path + ".lz4", "wb") as f:
-            f.write(coeffs_lz4)
-        result["lz4_total_bytes"] = len(desc_lz4) + len(coeffs_lz4)
     except ImportError:
         pass
 
@@ -337,7 +325,7 @@ def compressed_cloud_sizes(descriptor_path: str, values_path: str,
       - values (_values.npy): float64 non-background leaf values
       - mask (_nonbg_mask.npy): packed bits indicating which leaves are non-bg
 
-    Returns dict with raw, blosc2, and lz4 total sizes.
+    Returns dict with raw and blosc2 total sizes.
     """
     import numpy as np
 
@@ -351,7 +339,6 @@ def compressed_cloud_sizes(descriptor_path: str, values_path: str,
         "raw_mask_bytes": len(mask_data),
         "raw_total_bytes": len(desc_data) + len(values_data) + len(mask_data),
         "blosc2_total_bytes": float("nan"),
-        "lz4_total_bytes": float("nan"),
     }
 
     try:
@@ -360,15 +347,6 @@ def compressed_cloud_sizes(descriptor_path: str, values_path: str,
         v_c = blosc2.compress(values_data, typesize=4)
         m_c = blosc2.compress(mask_data, typesize=1)
         result["blosc2_total_bytes"] = len(d_c) + len(v_c) + len(m_c)
-    except ImportError:
-        pass
-
-    try:
-        import lz4.frame
-        d_c = lz4.frame.compress(desc_data)
-        v_c = lz4.frame.compress(values_data)
-        m_c = lz4.frame.compress(mask_data)
-        result["lz4_total_bytes"] = len(d_c) + len(v_c) + len(m_c)
     except ImportError:
         pass
 
@@ -419,7 +397,7 @@ def discover_cloud_files(directory):
 CLOUD_COLUMNS = [
     "grid_name", "threshold", "variant",
     "nodes", "boxes", "topo_bits",
-    "raw_total_bytes", "blosc2_total_bytes", "lz4_total_bytes",
+    "raw_total_bytes", "blosc2_total_bytes",
     "vdb_file_bytes",
     "n_nonbg_values",
 ]
@@ -447,7 +425,6 @@ def process_cloud(grid_name, threshold, variant, files):
     cs = compressed_cloud_sizes(files["descriptor"], files["values"], files["mask"])
     row["raw_total_bytes"] = cs["raw_total_bytes"]
     row["blosc2_total_bytes"] = cs["blosc2_total_bytes"]
-    row["lz4_total_bytes"] = cs["lz4_total_bytes"]
 
     if files.get("vdb"):
         row["vdb_file_bytes"] = os.path.getsize(files["vdb"])
@@ -502,7 +479,10 @@ def process_one(thingi_id, level, files):
         cs = compressed_omnitree_sizes(files["canonical"], vdb_file, level)
         row["can_raw_total_bytes"] = cs["raw_total_bytes"]
         row["can_blosc2_total_bytes"] = cs["blosc2_total_bytes"]
-        row["can_lz4_total_bytes"] = cs["lz4_total_bytes"]
+        row["can_desc_raw_bytes"] = cs["raw_descriptor_bytes"]
+        row["can_desc_blosc2_bytes"] = cs["blosc2_descriptor_bytes"]
+        row["can_coeffs_raw_bytes"] = cs["raw_coeffs_bytes"]
+        row["can_coeffs_blosc2_bytes"] = cs["blosc2_coeffs_bytes"]
 
     # Downsplit (pushdown)
     ds_file = None
@@ -518,7 +498,10 @@ def process_one(thingi_id, level, files):
         cs = compressed_omnitree_sizes(ds_file, vdb_file, level)
         row["ds_raw_total_bytes"] = cs["raw_total_bytes"]
         row["ds_blosc2_total_bytes"] = cs["blosc2_total_bytes"]
-        row["ds_lz4_total_bytes"] = cs["lz4_total_bytes"]
+        row["ds_desc_raw_bytes"] = cs["raw_descriptor_bytes"]
+        row["ds_desc_blosc2_bytes"] = cs["blosc2_descriptor_bytes"]
+        row["ds_coeffs_raw_bytes"] = cs["raw_coeffs_bytes"]
+        row["ds_coeffs_blosc2_bytes"] = cs["blosc2_coeffs_bytes"]
     
     # OpenVDB (all stats from the C++ vdb_topology_bits tool)
     if "openvdb" in files:
@@ -614,8 +597,8 @@ def main():
         # Print summary
         print(f"\n{'grid':>18s}  {'thresh':>6s}  {'variant':>10s}  "
               f"{'nodes':>8s}  {'boxes':>8s}  "
-              f"{'raw':>10s}  {'blosc2':>10s}  {'lz4':>10s}  {'vdb_file':>10s}  {'blosc2/vdb':>10s}")
-        print("-" * 110)
+              f"{'raw':>10s}  {'blosc2':>10s}  {'vdb_file':>10s}  {'blosc2/vdb':>10s}")
+        print("-" * 100)
         for _, r in df.iterrows():
             vdb = r.get("vdb_file_bytes", float("nan"))
             ratio = r["blosc2_total_bytes"] / vdb if pd.notna(vdb) and vdb > 0 else float("nan")
@@ -623,7 +606,6 @@ def main():
                   f"{int(r['nodes']):8d}  {int(r['boxes']):8d}  "
                   f"{int(r['raw_total_bytes']):10d}  "
                   f"{int(r['blosc2_total_bytes']) if pd.notna(r['blosc2_total_bytes']) else 'N/A':>10}  "
-                  f"{int(r['lz4_total_bytes']) if pd.notna(r['lz4_total_bytes']) else 'N/A':>10}  "
                   f"{int(vdb) if pd.notna(vdb) else 'N/A':>10}  "
                   f"{ratio:9.3f}x" if pd.notna(ratio) else "")
 
