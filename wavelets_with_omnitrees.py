@@ -167,6 +167,7 @@ def get_leaf_scalings(
 
 def _compute_node_levels(
     descriptor: dyada.descriptor.RefinementDescriptor,
+    base_level: npt.NDArray[np.int8] | None = None,
 ) -> list[npt.NDArray[np.int8]]:
     """Pre-compute per-dimension level for every descriptor node in a single forward pass.
 
@@ -176,7 +177,9 @@ def _compute_node_levels(
     num_dims = descriptor.get_num_dimensions()
     n = len(descriptor)
     levels: list[npt.NDArray[np.int8]] = [None] * n  # type: ignore
-    current_level = np.zeros(num_dims, dtype=np.int8)
+    current_level = (
+        np.zeros(num_dims, dtype=np.int8) if base_level is None else base_level.copy()
+    )
     # Stack entries: [remaining_children, saved_parent_level]
     stack: list = []
 
@@ -330,6 +333,7 @@ def _coarsening_round(
     num_dimensions: int,
     *,
     allow_partial: bool = False,
+    base_level: npt.NDArray[np.int8] | None = None,
 ) -> tuple[
     dyada.discretization.Discretization,
     list[Sequence[float]],
@@ -349,7 +353,7 @@ def _coarsening_round(
     planned_any = False
     round_discarded_l1 = 0.0
     descriptor = discretization.descriptor
-    node_levels = _compute_node_levels(descriptor)
+    node_levels = _compute_node_levels(descriptor, base_level=base_level)
 
     stack: list[int] = []
     desc_i = len(descriptor) - 1
@@ -684,7 +688,7 @@ def merged_node_coefficients(
 ) -> np.ndarray:
     """Compute wavelet coefficients for a merged non-leaf node when ``k_push >= 1``.
 
-    Generalises :func:`_merged_node_coefficients`.  When ``k_push`` dims are
+    When ``k_push`` dims are
     pushed down and the ``2^{k_push}`` siblings under one intermediate share
     the same refinement disjoint from ``push_dims``, they get absorbed into a
     single merged node with refinement ``merged_ref = child_ref | push_dims``.
@@ -924,7 +928,6 @@ def compress_by_downsplit_coarsening(
     while True:
         # ── Downsplit round ─────────────────────────────────────────────────
         descriptor = discretization.descriptor
-        nd = descriptor.get_num_dimensions()
         candidates: list[int] = []
         for desc_index in range(len(descriptor)):
             num_bits_set = descriptor[desc_index].count()
@@ -1304,6 +1307,262 @@ def compress_by_downsplit_coarsening(
             break
 
     return discretization, coefficients, total_discarded_l1
+
+
+def compress_by_downsplit_coarsening_decomposed(
+    discretization: "dyada.discretization.Discretization",
+    coefficients: list[Sequence[float]],
+    coarsening_threshold: float = 0.0,
+) -> "tuple[dyada.discretization.Discretization, list[np.ndarray], float]":
+    """Decomposition-based variant of :func:`compress_by_downsplit_coarsening`.
+
+    Each round:
+
+    1. Collect candidates (multi-dim nodes with ≥2 leaf children), filtered by
+       a persistent "dirty" bitmask so subtrees that stayed clean last round
+       are skipped.
+    2. Reduce to outermost (non-overlapping) cuts — a descendant candidate is
+       dropped if its ancestor is also a candidate this round.
+    3. ``decompose_descriptor`` the current tree at each cut.
+    4. Per sub (independently): downsplit → ``_coarsening_round`` → (only if
+       coarsening happened) ``normalize_uniqueness``.  If no coarsening
+       occurred the original sub + its original coefficient slice are kept
+       and the sub's whole range is marked clean for the next round.
+    5. ``compose_descriptors`` the (possibly modified) subs back onto the
+       parent.  Coefficients are gathered via the decompose/compose mapping
+       chain: parent-region nodes use the source's coefficients, sub-region
+       nodes use either the (modified) sub's new coefficients or the source
+       slice for clean subs.
+
+    Terminates when every sub is clean in a round — i.e. no candidate
+    downsplit anywhere in the tree can produce further coarsening.
+    """
+    # load lazily -- currently not in dyada main
+    from dyada.descriptor_builder import compose_descriptors, decompose_descriptor
+    linearization = discretization._linearization
+    num_dimensions = discretization.descriptor.get_num_dimensions()
+    total_discarded_l1 = 0.0
+
+    # Per-index dirty mask over the CURRENT descriptor.  All True initially so
+    # the first round considers every candidate.
+    dirty = ba.bitarray(len(discretization.descriptor))
+    dirty.setall(True)
+
+    while True:
+        descriptor = discretization.descriptor
+        n = len(descriptor)
+
+        # ── 1. Collect candidates (respect dirty mask).
+        # A candidate is any internal node with ≥2 leaf children.  Multi-dim
+        # ones get a downsplit + cascading coarsen; single-dim ones skip the
+        # downsplit step and go straight to the cascading coarsen (they've
+        # nothing to push, but can still collapse into a leaf).
+        candidates: list[int] = []
+        for desc_index in range(n):
+            if not dirty[desc_index]:
+                continue
+            if descriptor[desc_index].count() < 1:
+                continue
+            if (
+                sum(
+                    1 if descriptor.is_box(c) else 0
+                    for c in descriptor.get_children(desc_index)
+                )
+                < 2
+            ):
+                continue
+            candidates.append(desc_index)
+
+        if not candidates:
+            break
+
+        # ── 2. Pick best dim per multi-dim candidate, keep only outermost.
+        plans: list[tuple[int, ba.bitarray | None, int]] = []  # (ci, push or None, ce)
+        prev_end = 0
+        for ci in sorted(candidates):
+            if ci < prev_end:
+                continue  # inside a previous cut's subtree
+            ref = ba.bitarray(descriptor[ci])
+            k = ref.count()
+            ce = descriptor.get_child_ranges(ci)[-1][1]
+            if k < 2:
+                # Single-dim — coarsen-only, no push.
+                plans.append((ci, None, ce))
+            else:
+                refined_dims = get_refined_dimensions_desc(ref)
+                best_dim, best_score = refined_dims[0], float("inf")
+                for global_dim in refined_dims:
+                    d_local = get_local_bit_index(global_dim, refined_dims)
+                    score = abs(coefficients[ci][_one_d_coeff_index(d_local, k)])
+                    if score < best_score:
+                        best_score, best_dim = score, global_dim
+                push = ba.bitarray(descriptor.d_zeros)
+                push[best_dim] = 1
+                plans.append((ci, push, ce))
+            prev_end = ce
+
+        if not plans:
+            break
+
+        cut_indices = [ci for ci, _, _ in plans]
+        push_of = {ci: push for ci, push, _ in plans}
+
+        # Per-cut base level (the cut node's depth in the current tree),
+        # needed so each sub's coarsening threshold uses the correct
+        # ``box_volume`` even though the sub's root starts at index 0.
+        source_node_levels = _compute_node_levels(descriptor)
+
+        # ── 3. Decompose at cut points. ──────────────────────────────────
+        parent_desc, sub_descs, pmap, _smaps = decompose_descriptor(
+            descriptor, cut_indices
+        )
+
+        # ── 4. Per-sub: downsplit + coarsen + normalize (all local). ─────
+        processed: list[tuple["dyada.descriptor.RefinementDescriptor", list, bool]] = []
+        any_changed = False
+        for k, ci in enumerate(cut_indices):
+            ce = plans[k][2]
+            sub_coeffs = [
+                np.asarray(coefficients[j], dtype=np.float64).copy()
+                for j in range(ci, ce)
+            ]
+            sub_disc = dyada.discretization.Discretization(
+                linearization, sub_descs[k]
+            )
+            push = push_of[ci]
+            if push is None:
+                # Single-dim cut: skip downsplit, go straight to coarsening.
+                cur_disc, cur_coeffs = sub_disc, sub_coeffs
+            else:
+                cur_disc, cur_coeffs = apply_downsplits(
+                    sub_disc, sub_coeffs, [(0, push)]
+                )
+            # Cascade coarsening inside the sub until no further change.
+            # One ``_coarsening_round`` catches a single level; iterating here
+            # is what lets e.g. a post-downsplit "R + intermediates + leaves"
+            # sub fully collapse to a single leaf when the threshold permits.
+            sub_discarded = 0.0
+            coarsened_inside = False
+            while True:
+                new_disc, new_coeffs, planned_any, round_discarded = _coarsening_round(
+                    cur_disc,
+                    cur_coeffs,
+                    coarsening_threshold,
+                    num_dimensions,
+                    base_level=source_node_levels[ci],
+                )
+                if not planned_any:
+                    break
+                coarsened_inside = True
+                cur_disc, cur_coeffs = new_disc, new_coeffs
+                sub_discarded += round_discarded
+            if not coarsened_inside:
+                processed.append((sub_descs[k], sub_coeffs, False))
+                continue
+            total_discarded_l1 += sub_discarded
+            normalized_disc, normalized_coeffs = normalize_uniqueness(
+                cur_disc, cur_coeffs
+            )
+            processed.append((normalized_disc.descriptor, normalized_coeffs, True))
+            any_changed = True
+
+        if not any_changed:
+            break  # every sub clean → converged
+
+        # ── 5. Recompose parent + (modified or original) subs. ───────────
+        graft_slots = {next(iter(pmap[ci])) for ci in cut_indices}
+        subs_by_box = {
+            parent_desc.to_box_index(next(iter(pmap[ci]))): processed[k][0]
+            for k, ci in enumerate(cut_indices)
+        }
+        combined_desc, compose_base_map, compose_sub_maps = compose_descriptors(
+            parent_desc, subs_by_box
+        )
+
+        # ── 6. Reassemble coefficients. ──────────────────────────────────
+        new_coefficients: list[np.ndarray | None] = [None] * len(combined_desc)
+        # Parent region: for every source not inside a cut, route through
+        # parent_mapping then compose_base_map.
+        for source_i, ps in enumerate(pmap):
+            if not ps:
+                continue
+            pi = next(iter(ps))
+            if pi in graft_slots:
+                continue
+            combined_i = next(iter(compose_base_map[pi]))
+            new_coefficients[combined_i] = coefficients[source_i]
+        # Sub regions.
+        for k, ci in enumerate(cut_indices):
+            _, sub_c, _ = processed[k]
+            box_idx = parent_desc.to_box_index(next(iter(pmap[ci])))
+            sub_map = compose_sub_maps[box_idx]
+            for sub_i, combined_i_set in enumerate(sub_map):
+                new_coefficients[next(iter(combined_i_set))] = sub_c[sub_i]
+        assert all(c is not None for c in new_coefficients), (
+            "coefficient reassembly left unfilled slots"
+        )
+
+        # ── 7. Build the next round's dirty mask. ────────────────────────
+        new_dirty = ba.bitarray(len(combined_desc))
+        new_dirty.setall(False)
+        # Parent region: inherit from old dirty.
+        for source_i, ps in enumerate(pmap):
+            if not ps:
+                continue
+            pi = next(iter(ps))
+            if pi in graft_slots:
+                continue
+            new_dirty[next(iter(compose_base_map[pi]))] = dirty[source_i]
+        # Sub regions: clean subs inherit through 1:1 identity; modified subs
+        # are fully dirty.
+        for k, ci in enumerate(cut_indices):
+            sub_d, _, modified = processed[k]
+            box_idx = parent_desc.to_box_index(next(iter(pmap[ci])))
+            sub_map = compose_sub_maps[box_idx]
+            if modified:
+                for combined_i_set in sub_map:
+                    new_dirty[next(iter(combined_i_set))] = True
+                # If the sub collapsed to a single leaf, the ancestor in the
+                # parent that holds this graft slot may have gained a leaf
+                # child and become a new candidate — mark it dirty too.
+                if len(sub_d) == 1:
+                    graft_parent = pmap_parent_of_graft_in_combined(
+                        parent_desc, compose_base_map, next(iter(pmap[ci]))
+                    )
+                    if graft_parent is not None:
+                        new_dirty[graft_parent] = True
+            else:
+                for sub_i, combined_i_set in enumerate(sub_map):
+                    new_dirty[next(iter(combined_i_set))] = dirty[ci + sub_i]
+
+        # ── 8. Commit. ──────────────────────────────────────────────────
+        discretization = dyada.discretization.Discretization(linearization, combined_desc)
+        coefficients = new_coefficients
+        dirty = new_dirty
+
+    return discretization, coefficients, total_discarded_l1
+
+
+def pmap_parent_of_graft_in_combined(
+    parent_desc: "dyada.descriptor.RefinementDescriptor",
+    compose_base_map: list[set[int]],
+    graft_leaf_idx_in_parent: int,
+) -> int | None:
+    """Find the combined-tree index of the parent of a given graft slot.
+
+    Returns None if the graft slot is the root of the parent (no parent).
+    """
+    # Scan parent_desc for the node whose children include graft_leaf_idx_in_parent.
+    # This is O(len(parent_desc)) worst case — acceptable since cuts per round
+    # are small and this runs at most once per cut.
+    for parent_i in range(len(parent_desc)):
+        ref = parent_desc[parent_i]
+        if ref.count() == 0:
+            continue
+        for c_start, _ in parent_desc.get_child_ranges(parent_i):
+            if c_start == graft_leaf_idx_in_parent:
+                return next(iter(compose_base_map[parent_i]))
+    return None
 
 
 def normalize_uniqueness(

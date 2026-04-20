@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+from icecream import ic
 import pytest
 import random
 
@@ -20,6 +21,7 @@ from wavelets_with_omnitrees import (
     get_resampled_image,
     compress_by_omnitree_coarsening,
     compress_by_downsplit_coarsening,
+    compress_by_downsplit_coarsening_decomposed,
     apply_downsplits,
     normalize_uniqueness,
     downsplit_node_coefficients,
@@ -114,6 +116,30 @@ def _plot_tikz(disc, labels, name):
             all_labels[index] = labels[leaf_index]
             leaf_index += 1
     dyada.plot_tree_tikz(disc.descriptor, labels=all_labels, filename=name + "_tree")
+
+
+# def _plot_tikz(disc, labels, name):
+#     dyada.plot_all_boxes_2d(
+#         disc,
+#         labels=labels,
+#         backend="tikz",
+#         filename=name,
+#     )
+#     dyada.plot_tree_tikz(
+#         disc.descriptor, labels=_tree_labels(disc, labels), filename=name + "_tree"
+#     )
+
+
+# def _plot_tikz_3d(disc, labels, name):
+#     dyada.plot_all_boxes_3d(
+#         disc,
+#         labels=labels,
+#         backend="tikz",
+#         filename=name,
+#     )
+#     dyada.plot_tree_tikz(
+#         disc.descriptor, labels=_tree_labels(disc, labels), filename=name + "_tree"
+#     )
 
 
 _INSUFFICIENT_DOWNSPLIT_CANDIDATES = [
@@ -790,3 +816,80 @@ def test_3d_random_multi_dim_downsplits_roundtrip():
                 equal_nan=True,
                 err_msg=f"{label}: normalised coefficient at node {i} differs",
             )
+
+
+def test_decomposed_and_batched_downsplit_can_diverge():
+    """The decomposition-based and batched downsplit schedulers are both valid
+    greedy schedulers, but they don't always converge to the same tree.
+
+    Smallest case found: 3D level-2 full grid with the indicator function of
+    the ``x_mid == y_mid`` plane
+    """
+    disc = _build_full_grid(3, 2)
+    pts = _midpoints(disc)
+    nodal = (pts[:, 0] == pts[:, 1]).astype(np.float64)
+
+    coef = transform_to_all_wavelet_coefficients(disc, nodal)
+    root_scaling = coef[0][0]
+    for c in coef:
+        c[0] = np.nan
+    coef[0][0] = root_scaling
+
+    d_batched, c_batched, l1_batched = compress_by_downsplit_coarsening(
+        disc, [c.copy() for c in coef], 0.0
+    )
+    d_decomp, c_decomp, l1_decomp = compress_by_downsplit_coarsening_decomposed(
+        disc, [c.copy() for c in coef], 0.0
+    )
+
+    assert d_batched.descriptor._data != d_decomp.descriptor._data
+    assert len(d_batched) == 10
+    assert len(d_decomp) == 18
+    assert l1_batched == 0.0
+    assert l1_decomp == 0.0
+
+    # Both reconstructions are lossless.
+    target_level = disc.descriptor.get_maximum_level().astype(np.int64)
+    raster_orig = get_resampled_image(disc, nodal, target_level)
+    for d, c in [(d_batched, c_batched), (d_decomp, c_decomp)]:
+        raster = get_resampled_image(d, get_leaf_scalings(d, c), target_level)
+        np.testing.assert_array_equal(raster, raster_orig)
+
+
+def test_decomposed_and_batched_downsplit_diverge_on_random_binary():
+    bits = ba.bitarray("111" + "000" * 7 + "111" + "000" * 8)
+    desc = dyada.descriptor.RefinementDescriptor.from_binary(3, bits)
+    disc = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(), desc
+    )
+    nodal = np.array(
+        [1, 0, 0, 1, 1, 1, 0,      # collapsed octants 0..6
+         1, 1, 1, 1, 1, 1, 1, 1],  # octant 7's 8 original values (all 1)
+        dtype=np.float64,
+    )
+    assert len(nodal) == len(disc) == 15
+
+    coef = transform_to_all_wavelet_coefficients(disc, nodal)
+    root_scaling = coef[0][0]
+    for c in coef:
+        c[0] = np.nan
+    coef[0][0] = root_scaling
+
+    d_batched, c_batched, l1_batched = compress_by_downsplit_coarsening(
+        disc, [c.copy() for c in coef], 0.0
+    )
+    d_decomp, c_decomp, l1_decomp = compress_by_downsplit_coarsening_decomposed(
+        disc, [c.copy() for c in coef], 0.0
+    )
+
+    assert d_batched.descriptor._data != d_decomp.descriptor._data
+    assert len(d_batched) == 6
+    assert len(d_decomp) == 5
+    assert l1_batched == 0.0
+    assert l1_decomp == 0.0
+
+    target_level = disc.descriptor.get_maximum_level().astype(np.int64)
+    raster_orig = get_resampled_image(disc, nodal, target_level)
+    for d, c in [(d_batched, c_batched), (d_decomp, c_decomp)]:
+        raster = get_resampled_image(d, get_leaf_scalings(d, c), target_level)
+        np.testing.assert_array_equal(raster, raster_orig)
