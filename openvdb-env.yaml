@@ -12,7 +12,6 @@
         - blosc2                              
         - brotli
         - icecream                            
-        - lz4                                                                    
         - matplotlib
         - py-spy
         - tqdm
