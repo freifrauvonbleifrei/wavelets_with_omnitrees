@@ -14,13 +14,22 @@ THRESHOLDS=( 0 1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 1e-2)
 
 mkdir -p "$BASE_DIR"
 
+PREV_WORK_DIR=""
 for THR in "${THRESHOLDS[@]}"; do
     WORK_DIR="$BASE_DIR/thr_${THR}"
     LOG="$BASE_DIR/log_${THR}.txt"
 
+    INPUT_DIR_ARG=""
+    if [ -n "$PREV_WORK_DIR" ]; then
+        INPUT_DIR_ARG="--input-dir $PREV_WORK_DIR"
+    fi
+
     echo "============================================================"
     echo "$(date '+%Y-%m-%d %H:%M:%S') — threshold=$THR"
     echo "  work-dir: $WORK_DIR"
+    if [ -n "$PREV_WORK_DIR" ]; then
+        echo "  input-dir: $PREV_WORK_DIR"
+    fi
     echo "  log: $LOG"
     echo "============================================================"
 
@@ -32,13 +41,16 @@ for THR in "${THRESHOLDS[@]}"; do
         --split-levels $SPLIT_LEVELS \
         --threshold "$THR" \
         --skip-serial \
-	--only-subs \
+        --only-subs \
+        $INPUT_DIR_ARG \
         --work-dir "$WORK_DIR" \
         2>&1 | tee "$LOG"
 
     echo ""
     echo "$(date '+%Y-%m-%d %H:%M:%S') — threshold=$THR DONE"
     echo ""
+
+    PREV_WORK_DIR="$WORK_DIR"
 done
 
 echo "============================================================"

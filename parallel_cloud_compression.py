@@ -10,6 +10,7 @@ Usage:
 """
 
 import argparse
+import json
 import sys
 import os
 import time
@@ -40,6 +41,7 @@ from wavelets_with_omnitrees import (
     transform_to_all_wavelet_coefficients,
     get_leaf_scalings,
     compress_by_downsplit_coarsening,
+    compress_by_omnitree_coarsening,
 )
 
 
@@ -68,6 +70,17 @@ def _init_worker(vdb_path, grid_name):
         pass
     from compare_cloud import read_vdb_grid
     _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
+
+
+def _init_worker_no_vdb():
+    """Pool initializer for cascaded mode: install dyada cache only (no VDB needed)."""
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from dyada_cache_patch import install
+        install()
+    except ImportError:
+        pass
 
 
 def compress_partition(args_tuple):
@@ -133,6 +146,72 @@ def compress_partition(args_tuple):
     )
 
 
+def compress_partition_cascaded(args_tuple):
+    """Compress a partition starting from a previously-compressed result.
+
+    Loads descriptor + leaf values from input_dir, transforms to wavelet
+    coefficients, and compresses with the new (higher) threshold.
+    No VDB grid needed.
+    """
+    (part_idx, input_dir, threshold, work_dir) = args_tuple
+
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from dyada_cache_patch import install
+        install()
+    except ImportError:
+        pass
+
+    from wavelets_with_omnitrees import (
+        transform_to_all_wavelet_coefficients,
+        get_leaf_scalings,
+        compress_by_downsplit_coarsening,
+    )
+    import numpy as np
+    import dyada.descriptor
+    import dyada.discretization
+    import dyada.linearization
+
+    # Load previous threshold's result
+    desc_file, vals_file = partition_paths(input_dir, part_idx)
+    desc = dyada.descriptor.RefinementDescriptor.from_file(desc_file)
+    leaf_values = np.load(vals_file)
+
+    disc = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(), desc
+    )
+
+    n_initial = len(desc)
+    coefficients = transform_to_all_wavelet_coefficients(disc, leaf_values)
+    coeff_list = [list(c) for c in coefficients]
+    disc_ds, coeff_ds, _ = compress_by_downsplit_coarsening(
+        disc, coeff_list, coarsening_threshold=threshold
+    )
+
+    # Extract leaf values for later recomposition
+    root_scaling = coeff_ds[0][0]
+    coeff_copy = [list(c) for c in coeff_ds]
+    for c in coeff_copy:
+        c[0] = np.nan
+    coeff_copy[0][0] = root_scaling
+    leaf_values_out = get_leaf_scalings(disc_ds, coeff_copy)
+
+    # Persist descriptor and values
+    out_desc_file, out_vals_file = partition_paths(work_dir, part_idx)
+    disc_ds.descriptor.to_file(out_desc_file.rsplit("_3d.bin", 1)[0])
+    np.save(out_vals_file, leaf_values_out)
+
+    return (
+        part_idx,
+        {
+            "initial_nodes": n_initial,
+            "compressed_nodes": len(disc_ds.descriptor),
+            "compressed_boxes": disc_ds.descriptor.get_num_boxes(),
+        },
+    )
+
+
 def load_partition(work_dir, part_idx):
     """Load a previously-saved partition.  Returns (descriptor, leaf_values, stats)."""
     import dyada.descriptor
@@ -170,13 +249,29 @@ def main():
                         "Default: auto (~4-8x more partitions than workers).")
     parser.add_argument("--work-dir", type=str, default="/tmp/parallel_cloud",
                         help="Directory for per-partition cache files (resumable).")
+    parser.add_argument("--input-dir", type=str, default=None,
+                        help="Directory with previous threshold's partitions. "
+                        "Workers load from here instead of VDB (cascading mode).")
     args = parser.parse_args()
 
     vdb_path = args.vdb
-    grid = read_vdb_grid(vdb_path, args.grid_name)
-    bbox_min, _, extent = vdb_grid_extent(grid)
-    per_dim_levels = np.minimum(levels_from_extent(extent), args.max_level)
-    print(f"Grid extent: {extent}, per-dim levels: {per_dim_levels}")
+    cascading = args.input_dir is not None
+
+    if cascading:
+        if os.path.realpath(args.input_dir) == os.path.realpath(args.work_dir):
+            parser.error("--input-dir and --work-dir must be different directories")
+        meta_path = os.path.join(args.input_dir, "metadata.json")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        bbox_min = np.array(meta["bbox_min"])
+        per_dim_levels = np.array(meta["per_dim_levels"])
+        print(f"Cascading from {args.input_dir}")
+        print(f"  per-dim levels: {per_dim_levels}")
+    else:
+        grid = read_vdb_grid(vdb_path, args.grid_name)
+        bbox_min, _, extent = vdb_grid_extent(grid)
+        per_dim_levels = np.minimum(levels_from_extent(extent), args.max_level)
+        print(f"Grid extent: {extent}, per-dim levels: {per_dim_levels}")
     print(f"Workers: {args.workers}, threshold: {args.threshold}")
 
     # ── Determine partition layout ─────────────────────────────────────────
@@ -217,13 +312,18 @@ def main():
 
     partition_args = []
     for flat_idx in range(n_partitions):
-        coord = flat_to_coord(flat_idx, grid_shape)
-        sub_origin = np.array(coord) * sub_grid_shape
-        sub_bbox_min = bbox_min + sub_origin
-        partition_args.append((
-            flat_idx, vdb_path, args.grid_name,
-            sub_bbox_min.tolist(), sub_levels.tolist(), args.threshold, work_dir,
-        ))
+        if cascading:
+            partition_args.append((
+                flat_idx, args.input_dir, args.threshold, work_dir,
+            ))
+        else:
+            coord = flat_to_coord(flat_idx, grid_shape)
+            sub_origin = np.array(coord) * sub_grid_shape
+            sub_bbox_min = bbox_min + sub_origin
+            partition_args.append((
+                flat_idx, vdb_path, args.grid_name,
+                sub_bbox_min.tolist(), sub_levels.tolist(), args.threshold, work_dir,
+            ))
 
     # Skip partitions whose output already exists on disk
     pending = []
@@ -239,12 +339,13 @@ def main():
     print(f"\nPartitioned into {n_partitions} sub-regions "
           f"(split_levels={grid_levels}, grid={grid_shape}, sub_levels={sub_levels})")
     print(f"Resume cache in {work_dir}/: {len(cached)} cached, {len(pending)} pending")
-    del grid
+    if not cascading:
+        del grid
 
     # ── Serial baseline (optional, skip with --skip-serial) ──────────────
     t_serial = None
     disc_serial = None
-    if not args.skip_serial:
+    if not args.skip_serial and not cascading:
         print("\n=== Serial baseline ===")
         t_serial_start = time.perf_counter()
         grid = read_vdb_grid(vdb_path, args.grid_name)
@@ -273,18 +374,37 @@ def main():
     child_stats = [None] * n_partitions
 
     if pending:
-        with ProcessPoolExecutor(
-            max_workers=args.workers,
-            initializer=_init_worker,
-            initargs=(vdb_path, args.grid_name),
-        ) as pool:
-            futures = {pool.submit(compress_partition, a): a[0] for a in pending}
+        if cascading:
+            pool_kwargs = dict(
+                max_workers=args.workers,
+                initializer=_init_worker_no_vdb,
+            )
+            worker_fn = compress_partition_cascaded
+        else:
+            pool_kwargs = dict(
+                max_workers=args.workers,
+                initializer=_init_worker,
+                initargs=(vdb_path, args.grid_name),
+            )
+            worker_fn = compress_partition
+        with ProcessPoolExecutor(**pool_kwargs) as pool:
+            futures = {pool.submit(worker_fn, a): a[0] for a in pending}
             for future in as_completed(futures):
                 part_idx, stats = future.result()
                 child_stats[part_idx] = stats
                 print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes, "
                       f"{stats['compressed_boxes']:7d} boxes "
                       f"(from {stats['initial_nodes']})")
+
+    # Save metadata for cascading to next threshold
+    meta = {
+        "bbox_min": bbox_min.tolist() if hasattr(bbox_min, 'tolist') else list(bbox_min),
+        "per_dim_levels": per_dim_levels.tolist() if hasattr(per_dim_levels, 'tolist') else list(per_dim_levels),
+        "grid_levels": list(grid_levels),
+        "n_partitions": n_partitions,
+    }
+    with open(os.path.join(work_dir, "metadata.json"), "w") as f:
+        json.dump(meta, f)
 
     if args.only_subs:
         return
@@ -349,10 +469,10 @@ def main():
           f"{composed_desc.get_num_boxes()} boxes, "
           f"{len(composed_vals)} leaf values")
 
-    # ── Final coarsening round ─────────────────────────────────────────────
+    # ── Final coarsening round (omnitree canonical, no downsplit) ──────────
     coefficients = transform_to_all_wavelet_coefficients(composed_disc, composed_vals)
     coeff_list = [list(c) for c in coefficients]
-    disc_final, coeff_final, _ = compress_by_downsplit_coarsening(
+    disc_final, coeff_final, _ = compress_by_omnitree_coarsening(
         composed_disc, coeff_list, coarsening_threshold=args.threshold
     )
     t_compose_and_final = time.perf_counter() - t_compose_start
