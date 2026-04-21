@@ -58,8 +58,8 @@ def partition_paths(work_dir, part_idx):
 _WORKER_GRID = None  # per-process cache of the VDB grid (set by _init_worker)
 
 
-def _init_worker(vdb_path, grid_name):
-    """Pool initializer: load the VDB once per worker process and cache it."""
+def _init_worker(vdb_path=None, grid_name=None):
+    """Pool initializer: set up imports and optionally load the VDB grid."""
     global _WORKER_GRID
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -68,121 +68,58 @@ def _init_worker(vdb_path, grid_name):
         install()
     except ImportError:
         pass
-    from compare_cloud import read_vdb_grid
-    _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
-
-
-def _init_worker_no_vdb():
-    """Pool initializer for cascaded mode: install dyada cache only (no VDB needed)."""
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        from dyada_cache_patch import install
-        install()
-    except ImportError:
-        pass
-
-
-def compress_partition(args_tuple):
-    """Compress a single sub-region of the VDB grid.  Runs in a worker process.
-
-    Reuses the per-worker VDB grid loaded by _init_worker to avoid re-reading
-    the (potentially multi-GB) VDB file on every task.
-    """
-    (part_idx, vdb_path, grid_name, sub_bbox_min, sub_levels,
-     threshold, work_dir) = args_tuple
-
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        from dyada_cache_patch import install
-        install()
-    except ImportError:
-        pass
-
-    from compare_cloud import read_vdb_grid, omnitree_from_vdb
-    from wavelets_with_omnitrees import (
-        transform_to_all_wavelet_coefficients,
-        get_leaf_scalings,
-        compress_by_downsplit_coarsening,
-    )
-    import numpy as np
-
-    global _WORKER_GRID
-    if _WORKER_GRID is None:
-        # Happens when compress_partition is called directly (e.g. serial run)
-        # without the pool initializer.
+    if vdb_path is not None:
+        from compare_cloud import read_vdb_grid
         _WORKER_GRID = read_vdb_grid(vdb_path, grid_name)
-    grid = _WORKER_GRID
-    disc, vals = omnitree_from_vdb(grid, np.array(sub_bbox_min), np.array(sub_levels))
+
+
+def compress_partition(task):
+    """Compress a single partition.  Runs in a worker process.
+
+    task is a dict with keys:
+      part_idx, work_dir, threshold  (always present)
+      input_dir                      (cascaded: load from previous output)
+      vdb_path, grid_name,
+      sub_bbox_min, sub_levels       (VDB mode: build omnitree from grid)
+    """
+    part_idx = task["part_idx"]
+    work_dir = task["work_dir"]
+    threshold = task["threshold"]
+    input_dir = task.get("input_dir")
+
+    # Skip if another process already wrote this partition
+    desc_file, vals_file = partition_paths(work_dir, part_idx)
+    if os.path.exists(desc_file) and os.path.exists(vals_file):
+        desc = dyada.descriptor.RefinementDescriptor.from_file(desc_file)
+        return (part_idx, {
+            "initial_nodes": -1,
+            "compressed_nodes": len(desc),
+            "compressed_boxes": desc.get_num_boxes(),
+            "skipped": True,
+        })
+
+    # Obtain discretization + leaf values
+    if input_dir is not None:
+        # Cascaded: load from previous threshold's output
+        in_desc, in_vals = partition_paths(input_dir, part_idx)
+        desc = dyada.descriptor.RefinementDescriptor.from_file(in_desc)
+        leaf_values = np.load(in_vals)
+        disc = dyada.discretization.Discretization(
+            dyada.linearization.MortonOrderLinearization(), desc
+        )
+    else:
+        # VDB mode: build omnitree from the per-worker grid
+        from compare_cloud import read_vdb_grid, omnitree_from_vdb
+        global _WORKER_GRID
+        if _WORKER_GRID is None:
+            _WORKER_GRID = read_vdb_grid(task["vdb_path"], task["grid_name"])
+        disc, leaf_values = omnitree_from_vdb(
+            _WORKER_GRID,
+            np.array(task["sub_bbox_min"]),
+            np.array(task["sub_levels"]),
+        )
 
     n_initial = len(disc.descriptor)
-    coefficients = transform_to_all_wavelet_coefficients(disc, vals)
-    coeff_list = [list(c) for c in coefficients]
-    disc_ds, coeff_ds, _ = compress_by_downsplit_coarsening(
-        disc, coeff_list, coarsening_threshold=threshold
-    )
-
-    # Extract leaf values for later recomposition
-    root_scaling = coeff_ds[0][0]
-    coeff_copy = [list(c) for c in coeff_ds]
-    for c in coeff_copy:
-        c[0] = np.nan
-    coeff_copy[0][0] = root_scaling
-    leaf_values = get_leaf_scalings(disc_ds, coeff_copy)
-
-    # Persist descriptor and values
-    desc_file, vals_file = partition_paths(work_dir, part_idx)
-    disc_ds.descriptor.to_file(desc_file.rsplit("_3d.bin", 1)[0])
-    np.save(vals_file, leaf_values)
-
-    return (
-        part_idx,
-        {
-            "initial_nodes": n_initial,
-            "compressed_nodes": len(disc_ds.descriptor),
-            "compressed_boxes": disc_ds.descriptor.get_num_boxes(),
-        },
-    )
-
-
-def compress_partition_cascaded(args_tuple):
-    """Compress a partition starting from a previously-compressed result.
-
-    Loads descriptor + leaf values from input_dir, transforms to wavelet
-    coefficients, and compresses with the new (higher) threshold.
-    No VDB grid needed.
-    """
-    (part_idx, input_dir, threshold, work_dir) = args_tuple
-
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        from dyada_cache_patch import install
-        install()
-    except ImportError:
-        pass
-
-    from wavelets_with_omnitrees import (
-        transform_to_all_wavelet_coefficients,
-        get_leaf_scalings,
-        compress_by_downsplit_coarsening,
-    )
-    import numpy as np
-    import dyada.descriptor
-    import dyada.discretization
-    import dyada.linearization
-
-    # Load previous threshold's result
-    desc_file, vals_file = partition_paths(input_dir, part_idx)
-    desc = dyada.descriptor.RefinementDescriptor.from_file(desc_file)
-    leaf_values = np.load(vals_file)
-
-    disc = dyada.discretization.Discretization(
-        dyada.linearization.MortonOrderLinearization(), desc
-    )
-
-    n_initial = len(desc)
     coefficients = transform_to_all_wavelet_coefficients(disc, leaf_values)
     coeff_list = [list(c) for c in coefficients]
     disc_ds, coeff_ds, _ = compress_by_downsplit_coarsening(
@@ -195,12 +132,11 @@ def compress_partition_cascaded(args_tuple):
     for c in coeff_copy:
         c[0] = np.nan
     coeff_copy[0][0] = root_scaling
-    leaf_values_out = get_leaf_scalings(disc_ds, coeff_copy)
+    out_leaf_values = get_leaf_scalings(disc_ds, coeff_copy)
 
     # Persist descriptor and values
-    out_desc_file, out_vals_file = partition_paths(work_dir, part_idx)
-    disc_ds.descriptor.to_file(out_desc_file.rsplit("_3d.bin", 1)[0])
-    np.save(out_vals_file, leaf_values_out)
+    disc_ds.descriptor.to_file(desc_file.rsplit("_3d.bin", 1)[0])
+    np.save(vals_file, out_leaf_values)
 
     return (
         part_idx,
@@ -312,24 +248,23 @@ def main():
 
     partition_args = []
     for flat_idx in range(n_partitions):
+        task = {"part_idx": flat_idx, "threshold": args.threshold, "work_dir": work_dir}
         if cascading:
-            partition_args.append((
-                flat_idx, args.input_dir, args.threshold, work_dir,
-            ))
+            task["input_dir"] = args.input_dir
         else:
             coord = flat_to_coord(flat_idx, grid_shape)
             sub_origin = np.array(coord) * sub_grid_shape
             sub_bbox_min = bbox_min + sub_origin
-            partition_args.append((
-                flat_idx, vdb_path, args.grid_name,
-                sub_bbox_min.tolist(), sub_levels.tolist(), args.threshold, work_dir,
-            ))
+            task.update(vdb_path=vdb_path, grid_name=args.grid_name,
+                        sub_bbox_min=sub_bbox_min.tolist(),
+                        sub_levels=sub_levels.tolist())
+        partition_args.append(task)
 
     # Skip partitions whose output already exists on disk
     pending = []
     cached = []
     for a in partition_args:
-        flat_idx = a[0]
+        flat_idx = a["part_idx"]
         desc_file, vals_file = partition_paths(work_dir, flat_idx)
         if os.path.exists(desc_file) and os.path.exists(vals_file):
             cached.append(flat_idx)
@@ -375,26 +310,23 @@ def main():
 
     if pending:
         if cascading:
-            pool_kwargs = dict(
-                max_workers=args.workers,
-                initializer=_init_worker_no_vdb,
-            )
-            worker_fn = compress_partition_cascaded
+            pool_kwargs = dict(max_workers=args.workers, initializer=_init_worker)
         else:
-            pool_kwargs = dict(
-                max_workers=args.workers,
-                initializer=_init_worker,
-                initargs=(vdb_path, args.grid_name),
-            )
-            worker_fn = compress_partition
+            pool_kwargs = dict(max_workers=args.workers, initializer=_init_worker,
+                               initargs=(vdb_path, args.grid_name))
         with ProcessPoolExecutor(**pool_kwargs) as pool:
-            futures = {pool.submit(worker_fn, a): a[0] for a in pending}
+            futures = {pool.submit(compress_partition, a): a["part_idx"]
+                       for a in pending}
             for future in as_completed(futures):
                 part_idx, stats = future.result()
                 child_stats[part_idx] = stats
-                print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes, "
-                      f"{stats['compressed_boxes']:7d} boxes "
-                      f"(from {stats['initial_nodes']})")
+                if stats.get("skipped"):
+                    print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes "
+                          f"(skipped, already on disk)")
+                else:
+                    print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes, "
+                          f"{stats['compressed_boxes']:7d} boxes "
+                          f"(from {stats['initial_nodes']})")
 
     # Save metadata for cascading to next threshold
     meta = {
