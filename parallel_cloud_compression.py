@@ -159,6 +159,8 @@ def main():
                         default="/workspace/wdas_cloud/wdas_cloud_sixteenth.vdb")
     parser.add_argument("--grid-name", type=str, default="density")
     parser.add_argument("--max-level", type=int, default=6)
+    parser.add_argument("--only-subs", action="store_true",
+                        help="run only the (parallel) sub-descriptor parts")
     parser.add_argument("--skip-serial", action="store_true",
                         help="Skip the serial baseline (faster for testing)")
     parser.add_argument("--split-levels", type=int, nargs="+", default=None,
@@ -283,6 +285,9 @@ def main():
                 print(f"  Worker {part_idx:5d}: {stats['compressed_nodes']:7d} nodes, "
                       f"{stats['compressed_boxes']:7d} boxes "
                       f"(from {stats['initial_nodes']})")
+
+    if args.only_subs:
+        return
 
     # Load all partitions (cached + freshly computed) from disk for compose.
     child_descriptors = [None] * n_partitions
