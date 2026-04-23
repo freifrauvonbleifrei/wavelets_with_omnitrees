@@ -77,6 +77,7 @@ def write_raw_csv(df, column, filename, outdir, integer=False):
     ).sort_index()
     pivot.columns = [f"l{int(c)}" for c in pivot.columns]
     path = os.path.join(outdir, filename)
+    kwargs = {"index": False, "na_rep": "nan"}
     if integer:
         kwargs["float_format"] = "%.0f"
     pivot.to_csv(path, **kwargs)
@@ -100,49 +101,49 @@ def write_aggregate_csv(df, methods, filename, outdir):
     return path
 
 
+EXTREMAL_RATIOS = [
+    # (filename, numerator column, denominator column, label)
+    ("extremal_vdb_over_ds.csv",       "vdb_total_coefficients", "ds_boxes",              "boxes"),
+    ("extremal_vdb_over_ds_bytes.csv", "vdb_file_bytes",         "ds_blosc2_total_bytes", "bytes"),
+]
+
+
 def write_extremal_ratios(df, outdir, n_extremes=10):
-    """Write CSV identifying thingies with largest/smallest vdb/ds ratio per level."""
+    """For each (numerator, denominator) pair, write the per-level top/bottom
+    thingies by ratio = numerator / denominator. Used to surface best/worst
+    vdb-vs-downsplit cases both in box counts and compressed bytes.
+    """
     levels = sorted(df["level"].unique())
-    all_rows = []
-    for level in levels:
-        sub = df[
-            (df["level"] == level)
-            & (df["vdb_total_coefficients"] > 0)
-            & (df["ds_boxes"] > 0)
-        ].copy()
-        if sub.empty:
-            continue
-        sub["vdb_over_ds"] = sub["vdb_total_coefficients"] / sub["ds_boxes"]
-        sub = sub.sort_values("vdb_over_ds")
+    paths = []
+    for filename, num_col, den_col, label in EXTREMAL_RATIOS:
+        ratio_col = f"vdb_over_ds_{label}"
+        all_rows = []
+        for level in levels:
+            sub = df[
+                (df["level"] == level) & (df[num_col] > 0) & (df[den_col] > 0)
+            ].copy()
+            if sub.empty:
+                continue
+            sub[ratio_col] = sub[num_col] / sub[den_col]
+            sub = sub.sort_values(ratio_col)
 
-        for _, row in sub.head(n_extremes).iterrows():
-            all_rows.append(
-                {
+            def _row(row, extremal):
+                return {
                     "level": level,
                     "thingi_id": int(row["thingi_id"]),
-                    "ds_boxes": int(row["ds_boxes"]),
-                    "can_boxes": int(row["can_boxes"]),
-                    "vdb_total_coefficients": int(row["vdb_total_coefficients"]),
-                    "vdb_over_ds": row["vdb_over_ds"],
-                    "extremal": "smallest",
+                    num_col: row[num_col],
+                    den_col: row[den_col],
+                    ratio_col: row[ratio_col],
+                    "extremal": extremal,
                 }
-            )
-        for _, row in sub.tail(n_extremes).iterrows():
-            all_rows.append(
-                {
-                    "level": level,
-                    "thingi_id": int(row["thingi_id"]),
-                    "ds_boxes": int(row["ds_boxes"]),
-                    "can_boxes": int(row["can_boxes"]),
-                    "vdb_total_coefficients": int(row["vdb_total_coefficients"]),
-                    "vdb_over_ds": row["vdb_over_ds"],
-                    "extremal": "largest",
-                }
-            )
 
-    path = os.path.join(outdir, "extremal_vdb_over_ds.csv")
-    pd.DataFrame(all_rows).to_csv(path, index=False)
-    return path
+            all_rows += [_row(r, "smallest") for _, r in sub.head(n_extremes).iterrows()]
+            all_rows += [_row(r, "largest")  for _, r in sub.tail(n_extremes).iterrows()]
+
+        path = os.path.join(outdir, filename)
+        pd.DataFrame(all_rows).to_csv(path, index=False)
+        paths.append(path)
+    return paths
 
 
 def write_slope_aggregate(df, outdir):
@@ -218,7 +219,8 @@ def main():
     print(
         f"Wrote {write_aggregate_csv(df, STORAGE_METHODS, 'storage_aggregate.csv', args.outdir)}"
     )
-    print(f"Wrote {write_extremal_ratios(df, args.outdir)}")
+    for p in write_extremal_ratios(df, args.outdir):
+        print(f"Wrote {p}")
     print(f"Wrote {write_slope_aggregate(df, args.outdir)}")
 
 
