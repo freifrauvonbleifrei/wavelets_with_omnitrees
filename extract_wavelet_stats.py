@@ -402,6 +402,19 @@ CLOUD_COLUMNS = [
     "n_nonbg_values",
 ]
 
+SWEEP_COLUMNS = [
+    "threshold",
+    "nodes", "boxes", "topo_bits",
+    "n_leaves", "n_nonbg_leaves",
+    "max_error", "mean_abs_error", "rmse",
+    "desc_raw_bytes", "values_raw_bytes", "raw_total_bytes",
+    "desc_blosc2_bytes", "values_blosc2_bytes", "blosc2_total_bytes",
+    "vdb_orig_file_bytes",
+    "vdb_orig_topo_bits", "vdb_orig_active_voxels", "vdb_orig_total_coefficients",
+    "vdb_recon_file_bytes",
+    "ratio_raw_vs_vdb", "ratio_blosc2_vs_vdb",
+]
+
 
 def process_cloud(grid_name, threshold, variant, files):
     """Extract stats for one cloud variant."""
@@ -522,6 +535,158 @@ def process_one(thingi_id, level, files):
     return row
 
 
+def discover_sweep_dirs(sweep_dir):
+    """Discover thr_* directories with final_3d.bin + final_values.npy."""
+    import glob
+    dirs = []
+    for d in sorted(glob.glob(os.path.join(sweep_dir, "thr_*"))):
+        if not os.path.isdir(d):
+            continue
+        desc = os.path.join(d, "final_3d.bin")
+        vals = os.path.join(d, "final_values.npy")
+        meta = os.path.join(d, "metadata.json")
+        if os.path.exists(desc) and os.path.exists(vals) and os.path.exists(meta):
+            thr_label = os.path.basename(d).removeprefix("thr_")
+            dirs.append((thr_label, d))
+    return dirs
+
+
+def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
+                            vdb_orig_file_bytes, vdb_orig_stats):
+    """Extract stats for one threshold in a cloud sweep."""
+    import numpy as np
+
+    row = {"threshold": thr_label}
+
+    desc_file = os.path.join(work_dir, "final_3d.bin")
+    vals_file = os.path.join(work_dir, "final_values.npy")
+
+    desc = RefinementDescriptor.from_file(desc_file)
+    disc = Discretization(MortonOrderLinearization(), desc)
+    leaf_values = np.load(vals_file)
+    background = float(grid.background)
+
+    n_nodes = len(desc)
+    n_boxes = desc.get_num_boxes()
+    row["nodes"] = n_nodes
+    row["boxes"] = n_boxes
+    row["topo_bits"] = n_nodes * DIMENSIONALITY
+    row["n_leaves"] = n_boxes
+    row["n_nonbg_leaves"] = int(np.count_nonzero(leaf_values != background))
+
+    # ── Error vs original VDB ─────────────────────────────────────────────
+    from compare_cloud import _build_subtree_end
+    grid_shape = tuple(1 << int(l) for l in per_dim_levels)
+    gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
+    subtree_end = _build_subtree_end(desc)
+
+    max_err = 0.0
+    sum_abs_err = 0.0
+    sum_sq_err = 0.0
+    n_voxels = 0
+
+    stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
+    leaf_idx = 0
+    while stack:
+        desc_i, ox, oy, oz, sx, sy, sz = stack.pop()
+        ref = desc[desc_i]
+
+        if ref.count() == 0:
+            val = float(leaf_values[leaf_idx])
+            leaf_idx += 1
+            buf = np.full((sx, sy, sz), background, dtype=np.float32)
+            grid.copyToArray(buf, ijk=(gx + ox, gy + oy, gz + oz))
+            diff = np.abs(buf - val)
+            err = float(diff.max())
+            if err > max_err:
+                max_err = err
+            count = sx * sy * sz
+            sum_abs_err += float(diff.sum())
+            sum_sq_err += float((diff * diff).sum())
+            n_voxels += count
+            continue
+
+        csx, csy, csz = sx, sy, sz
+        if ref[0]: csx //= 2
+        if ref[1]: csy //= 2
+        if ref[2]: csz //= 2
+
+        num_children = 1 << ref.count()
+        child_desc = desc_i + 1
+        child_entries = []
+        for child_idx in range(num_children):
+            cox, coy, coz = ox, oy, oz
+            local_bit = 0
+            for d in range(3):
+                if ref[d]:
+                    if (child_idx >> local_bit) & 1:
+                        if d == 0: cox += csx
+                        elif d == 1: coy += csy
+                        else: coz += csz
+                    local_bit += 1
+            child_entries.append((child_desc, cox, coy, coz, csx, csy, csz))
+            child_desc = int(subtree_end[child_desc])
+        for entry in reversed(child_entries):
+            stack.append(entry)
+
+    row["max_error"] = max_err
+    row["mean_abs_error"] = sum_abs_err / n_voxels if n_voxels else 0.0
+    row["rmse"] = (sum_sq_err / n_voxels) ** 0.5 if n_voxels else 0.0
+
+    # ── Raw and compressed sizes ──────────────────────────────────────────
+    desc_data = open(desc_file, "rb").read()
+    values_data = leaf_values.astype(np.float32).tobytes()
+
+    row["desc_raw_bytes"] = len(desc_data)
+    row["values_raw_bytes"] = len(values_data)
+    row["raw_total_bytes"] = len(desc_data) + len(values_data)
+
+    try:
+        import blosc2
+        d_c = blosc2.compress(desc_data, typesize=1)
+        v_c = blosc2.compress(values_data, typesize=4)
+        row["desc_blosc2_bytes"] = len(d_c)
+        row["values_blosc2_bytes"] = len(v_c)
+        row["blosc2_total_bytes"] = len(d_c) + len(v_c)
+    except ImportError:
+        row["desc_blosc2_bytes"] = float("nan")
+        row["values_blosc2_bytes"] = float("nan")
+        row["blosc2_total_bytes"] = float("nan")
+
+    # ── VDB reference stats ───────────────────────────────────────────────
+    row["vdb_orig_file_bytes"] = vdb_orig_file_bytes
+    row["vdb_orig_topo_bits"] = vdb_orig_stats.get("total_topology_bits", float("nan"))
+    row["vdb_orig_active_voxels"] = vdb_orig_stats.get(
+        "active_leaf_voxels", vdb_orig_stats.get("active_voxels", float("nan"))
+    )
+    row["vdb_orig_total_coefficients"] = vdb_orig_stats.get(
+        "total_coefficients", float("nan")
+    )
+
+    # Reconstructed VDB file size (if present)
+    recon_vdb = None
+    for name in ("final.vdb",):
+        p = os.path.join(work_dir, name)
+        if os.path.exists(p):
+            recon_vdb = p
+            break
+    # Also check for final_thr_*.vdb or final_perm*.vdb
+    if recon_vdb is None:
+        import glob
+        candidates = glob.glob(os.path.join(work_dir, "final*.vdb"))
+        if candidates:
+            recon_vdb = candidates[0]
+    row["vdb_recon_file_bytes"] = os.path.getsize(recon_vdb) if recon_vdb else float("nan")
+
+    # Compression ratios
+    vdb_bytes = vdb_orig_file_bytes
+    row["ratio_raw_vs_vdb"] = row["raw_total_bytes"] / vdb_bytes if vdb_bytes else float("nan")
+    blosc2 = row.get("blosc2_total_bytes", float("nan"))
+    row["ratio_blosc2_vs_vdb"] = blosc2 / vdb_bytes if vdb_bytes and not pd.isna(blosc2) else float("nan")
+
+    return row
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Extract storage statistics from wavelet compression output files."
@@ -537,14 +702,32 @@ def main():
         help="Directory containing cloud output files (_3d.bin, _values.npy, _nonbg_mask.npy)",
     )
     parser.add_argument(
+        "--sweep-dir",
+        default=None,
+        help="Base directory of a threshold sweep (contains thr_* subdirs with "
+        "final_3d.bin + final_values.npy + metadata.json)",
+    )
+    parser.add_argument(
+        "--vdb",
+        default=None,
+        help="Original VDB file (required for --sweep-dir error computation)",
+    )
+    parser.add_argument(
+        "--grid-name",
+        default="density",
+        help="VDB grid name (default: density)",
+    )
+    parser.add_argument(
         "--csv",
         default=CSV_FILENAME,
         help=f"Output CSV file (default: {CSV_FILENAME})",
     )
     args = parser.parse_args()
 
-    if args.dir is None and args.cloud_dir is None:
-        parser.error("at least one of --dir or --cloud-dir is required")
+    if args.dir is None and args.cloud_dir is None and args.sweep_dir is None:
+        parser.error("at least one of --dir, --cloud-dir, or --sweep-dir is required")
+    if args.sweep_dir is not None and args.vdb is None:
+        parser.error("--vdb is required with --sweep-dir")
 
     # ── Thingi10k binary occupancy stats ───────────────────────────────────
     if args.dir is not None:
@@ -588,7 +771,6 @@ def main():
             row = process_cloud(grid_name, threshold, variant, files)
             rows.append(row)
 
-        import pandas as pd
         df = pd.DataFrame(rows)
         df = df.reindex(columns=CLOUD_COLUMNS)
         df.to_csv(cloud_csv, index=False)
@@ -608,6 +790,91 @@ def main():
                   f"{int(r['blosc2_total_bytes']) if pd.notna(r['blosc2_total_bytes']) else 'N/A':>10}  "
                   f"{int(vdb) if pd.notna(vdb) else 'N/A':>10}  "
                   f"{ratio:9.3f}x" if pd.notna(ratio) else "")
+
+    # ── Cloud sweep stats (--sweep-dir) ───────────────────────────────────
+    if args.sweep_dir is not None:
+        import numpy as np
+        from compare_cloud import read_vdb_grid, vdb_grid_extent, levels_from_extent
+
+        sweep_dirs = discover_sweep_dirs(args.sweep_dir)
+        if not sweep_dirs:
+            print(f"No thr_* directories with final results in {args.sweep_dir}/")
+            return
+
+        print(f"\n=== Cloud sweep: {args.sweep_dir} ===")
+        print(f"Source VDB: {args.vdb}")
+        print(f"Thresholds: {len(sweep_dirs)}")
+
+        # Load source VDB once
+        grid = read_vdb_grid(args.vdb, args.grid_name)
+        bbox_min, _, extent = vdb_grid_extent(grid)
+        per_dim_levels = levels_from_extent(extent)
+        # Cap to metadata's per_dim_levels if available
+        with open(os.path.join(sweep_dirs[0][1], "metadata.json")) as f:
+            meta = json.load(f)
+        per_dim_levels = np.array(meta["per_dim_levels"])
+        bbox_min = np.array(meta["bbox_min"])
+        print(f"Grid: bbox_min={bbox_min.tolist()}, per_dim_levels={per_dim_levels.tolist()}")
+
+        # VDB reference stats
+        vdb_orig_file_bytes = os.path.getsize(args.vdb)
+        vdb_orig_stats = openvdb_topology_bits(args.vdb)
+        if not vdb_orig_stats:
+            from compare_cloud import vdb_topology_stats_python
+            vdb_orig_stats = vdb_topology_stats_python(grid)
+            vdb_orig_stats["total_topology_bits"] = vdb_orig_stats.get(
+                "total_topo_bits_approx"
+            )
+        print(f"VDB: {vdb_orig_file_bytes:,} bytes, "
+              f"topo={vdb_orig_stats.get('total_topology_bits', '?')} bits, "
+              f"active={vdb_orig_stats.get('active_leaf_voxels', vdb_orig_stats.get('active_voxels', '?'))}")
+        print()
+
+        rows = []
+        for thr_label, work_dir in sweep_dirs:
+            print(f"  thr={thr_label} ...", end="", flush=True)
+            row = process_sweep_threshold(
+                thr_label, work_dir, grid, bbox_min, per_dim_levels,
+                vdb_orig_file_bytes, vdb_orig_stats,
+            )
+            rows.append(row)
+            print(f" {row['nodes']:,} nodes, {row['boxes']:,} boxes, "
+                  f"max_err={row['max_error']:.6f}")
+
+        sweep_csv = args.csv.rsplit(".", 1)[0] + "_sweep.csv"
+        df = pd.DataFrame(rows)
+        df = df.reindex(columns=SWEEP_COLUMNS)
+        df.to_csv(sweep_csv, index=False)
+        print(f"\nSweep results in: {sweep_csv}")
+
+        # Print summary table
+        print(f"\n{'thresh':>8s}  {'nodes':>8s}  {'boxes':>8s}  "
+              f"{'max_err':>10s}  {'mae':>10s}  {'rmse':>10s}  "
+              f"{'raw':>10s}  {'blosc2':>10s}  "
+              f"{'raw/vdb':>8s}  {'bl2/vdb':>8s}")
+        print("-" * 106)
+        def _fmt(val, fmt="{:10d}", na="N/A"):
+            try:
+                if pd.isna(val):
+                    return f"{na:>10}"
+            except (TypeError, ValueError):
+                pass
+            return fmt.format(val)
+
+        for _, r in df.iterrows():
+            bl2 = r.get("blosc2_total_bytes", float("nan"))
+            raw_ratio = r.get("ratio_raw_vs_vdb", float("nan"))
+            bl2_ratio = r.get("ratio_blosc2_vs_vdb", float("nan"))
+            bl2_s = _fmt(bl2, "{:10.0f}")
+            raw_r_s = _fmt(raw_ratio, "{:7.3f}x", "    N/A")
+            bl2_r_s = _fmt(bl2_ratio, "{:7.3f}x", "    N/A")
+            print(
+                f"{r['threshold']:>8s}  "
+                f"{int(r['nodes']):8d}  {int(r['boxes']):8d}  "
+                f"{r['max_error']:10.6f}  {r['mean_abs_error']:10.6f}  {r['rmse']:10.6f}  "
+                f"{int(r['raw_total_bytes']):10d}  "
+                f"{bl2_s}  {raw_r_s}  {bl2_r_s}"
+            )
 
 
 if __name__ == "__main__":

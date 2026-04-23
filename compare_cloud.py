@@ -577,7 +577,136 @@ def _save_stage(output_dir, basename, disc, coefficients, per_dim_levels,
           f"{n_nonbg}/{len(values)} non-background)")
 
 
+def reconstruct_final_vdb(work_dir, source_vdb_path, grid_name="density"):
+    """Reconstruct a VDB from final_3d.bin + final_values.npy in work_dir.
+
+    Copies the coordinate transform from *source_vdb_path* so the output VDB
+    has the same world-space coordinate system as the original cloud.
+    Returns the path of the written VDB file.
+    """
+    import os
+    meta_path = os.path.join(work_dir, "metadata.json")
+    with open(meta_path) as f:
+        meta = json.load(f)
+    bbox_min = np.array(meta["bbox_min"])
+    per_dim_levels = np.array(meta["per_dim_levels"])
+
+    desc_file = os.path.join(work_dir, "final_3d.bin")
+    vals_file = os.path.join(work_dir, "final_values.npy")
+    if not os.path.exists(desc_file) or not os.path.exists(vals_file):
+        raise FileNotFoundError(
+            f"No final descriptor/values in {work_dir} "
+            f"(run the serial compose step first)"
+        )
+
+    descriptor = dyada.descriptor.RefinementDescriptor.from_file(desc_file)
+    discretization = dyada.discretization.Discretization(
+        dyada.linearization.MortonOrderLinearization(), descriptor
+    )
+    leaf_values = np.load(vals_file)
+
+    source_grid = read_vdb_grid(source_vdb_path, grid_name)
+    background = float(source_grid.background)
+    src_bbox_min, src_bbox_max = source_grid.evalActiveVoxelBoundingBox()
+
+    # Extract the full affine matrix from the source transform via probing,
+    # so rotation / translation are preserved even if direct assignment drops them.
+    xf = source_grid.transform
+    p0 = np.array(xf.indexToWorld((0, 0, 0)))
+    e0 = np.array(xf.indexToWorld((1, 0, 0))) - p0  # index i-axis in world
+    e1 = np.array(xf.indexToWorld((0, 1, 0))) - p0  # index j-axis in world
+    e2 = np.array(xf.indexToWorld((0, 0, 1))) - p0  # index k-axis in world
+    # OpenVDB Mat4d: row-vector-on-left convention  world = [i,j,k,1] * M
+    src_mat4 = [
+        [e0[0], e0[1], e0[2], 0.0],
+        [e1[0], e1[1], e1[2], 0.0],
+        [e2[0], e2[1], e2[2], 0.0],
+        [p0[0], p0[1], p0[2], 1.0],
+    ]
+
+    grid = omnitree_to_vdb(
+        discretization, leaf_values, per_dim_levels, bbox_min,
+        grid_name=grid_name, background=background,
+    )
+    grid.transform = vdb.createLinearTransform(src_mat4)
+
+    # Crop to the source grid's active bounding box
+    out_min, out_max = grid.evalActiveVoxelBoundingBox()
+    for dim in range(3):
+        if out_min[dim] < src_bbox_min[dim]:
+            lo = list(out_min)
+            hi = list(out_max)
+            hi[dim] = src_bbox_min[dim] - 1
+            grid.fill(tuple(lo), tuple(hi), background, active=False)
+        if out_max[dim] > src_bbox_max[dim]:
+            lo = list(out_min)
+            hi = list(out_max)
+            lo[dim] = src_bbox_max[dim] + 1
+            grid.fill(tuple(lo), tuple(hi), background, active=False)
+
+    out_path = os.path.join(work_dir, "final.vdb")
+    vdb.write(out_path, grids=[grid])
+    desc_stats = descriptor_stats(descriptor)
+    print(f"  {out_path}: {desc_stats['nodes']:,} nodes, "
+          f"{desc_stats['boxes']:,} boxes, {len(leaf_values):,} leaves, "
+          f"{os.path.getsize(out_path):,} bytes")
+    return out_path
+
+
+def reconstruct_main():
+    """CLI for reconstructing VDB files from a threshold sweep."""
+    import os, glob
+    parser = argparse.ArgumentParser(
+        description="Reconstruct VDB files from parallel cloud sweep results.",
+    )
+    parser.add_argument("source_vdb",
+                        help="Original VDB file (used for coordinate transform)")
+    parser.add_argument("sweep_dir",
+                        help="Base directory containing thr_* work directories")
+    parser.add_argument("--grid", default="density",
+                        help="VDB grid name (default: density)")
+    parser.add_argument("--thresholds", nargs="+", default=None,
+                        help="Specific thresholds to reconstruct "
+                        "(default: all thr_* dirs that have final results)")
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.source_vdb):
+        parser.error(f"Source VDB not found: {args.source_vdb}")
+    if not os.path.isdir(args.sweep_dir):
+        parser.error(f"Sweep directory not found: {args.sweep_dir}")
+
+    # Discover threshold directories
+    if args.thresholds:
+        work_dirs = [(t, os.path.join(args.sweep_dir, f"thr_{t}"))
+                     for t in args.thresholds]
+    else:
+        work_dirs = []
+        for d in sorted(glob.glob(os.path.join(args.sweep_dir, "thr_*"))):
+            if os.path.isdir(d):
+                thr_label = os.path.basename(d).removeprefix("thr_")
+                work_dirs.append((thr_label, d))
+
+    print(f"Source VDB: {args.source_vdb}")
+    print(f"Sweep dir:  {args.sweep_dir}")
+    print(f"Thresholds: {len(work_dirs)}\n")
+
+    for thr_label, work_dir in work_dirs:
+        final_desc = os.path.join(work_dir, "final_3d.bin")
+        if not os.path.exists(final_desc):
+            print(f"  thr={thr_label}: skipped (no final_3d.bin)")
+            continue
+        print(f"  thr={thr_label}:", end="", flush=True)
+        reconstruct_final_vdb(work_dir, args.source_vdb, grid_name=args.grid)
+
+
 def main():
+    # Dispatch "reconstruct" subcommand before building the compare parser,
+    # so that `python compare_cloud.py reconstruct ...` works alongside
+    # the original `python compare_cloud.py <vdb_file> ...` interface.
+    if len(sys.argv) > 1 and sys.argv[1] == "reconstruct":
+        sys.argv.pop(1)
+        return reconstruct_main()
+
     parser = argparse.ArgumentParser(
         description="Compare OpenVDB cloud vs omnitree wavelet compression.",
     )
