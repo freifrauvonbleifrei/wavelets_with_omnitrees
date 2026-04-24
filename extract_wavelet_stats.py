@@ -407,6 +407,7 @@ SWEEP_COLUMNS = [
     "nodes", "boxes", "topo_bits",
     "n_leaves", "n_nonbg_leaves",
     "Linf_error", "L1_error", "L2_error",
+    "Linf_sol", "L1_sol", "L2_sol",
     "desc_raw_bytes", "values_raw_bytes", "raw_total_bytes",
     "desc_blosc2_bytes", "values_blosc2_bytes", "blosc2_total_bytes",
     "vdb_orig_file_bytes",
@@ -583,6 +584,9 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
     max_err = 0.0
     sum_abs_err = 0.0
     sum_sq_err = 0.0
+    max_sol = 0.0
+    sum_abs_sol = 0.0
+    sum_sq_sol = 0.0
     n_voxels = 0
 
     stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
@@ -603,6 +607,12 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
             count = sx * sy * sz
             sum_abs_err += float(diff.sum())
             sum_sq_err += float((diff * diff).sum())
+            # Solution norms (piecewise-constant reconstruction)
+            abs_val = abs(val)
+            if abs_val > max_sol:
+                max_sol = abs_val
+            sum_abs_sol += abs_val * count
+            sum_sq_sol += val * val * count
             n_voxels += count
             continue
 
@@ -637,6 +647,9 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
     row["Linf_error"] = max_err
     row["L1_error"] = sum_abs_err / n_voxels if n_voxels else 0.0
     row["L2_error"] = (sum_sq_err / n_voxels) ** 0.5 if n_voxels else 0.0
+    row["Linf_sol"] = max_sol
+    row["L1_sol"] = sum_abs_sol / n_voxels if n_voxels else 0.0
+    row["L2_sol"] = (sum_sq_sol / n_voxels) ** 0.5 if n_voxels else 0.0
 
     # ── Raw and compressed sizes ──────────────────────────────────────────
     desc_data = open(desc_file, "rb").read()
@@ -890,8 +903,10 @@ def main():
             )
             rows.append(row)
             print(f" {row['nodes']:,} nodes, {row['boxes']:,} boxes, "
-                  f"Linf={row['Linf_error']:.6f}, L1={row['L1_error']:.6f}, "
-                  f"L2={row['L2_error']:.6f}")
+                  f"err Linf={row['Linf_error']:.6f} L1={row['L1_error']:.6f} "
+                  f"L2={row['L2_error']:.6f}, "
+                  f"sol Linf={row['Linf_sol']:.6f} L1={row['L1_sol']:.6f} "
+                  f"L2={row['L2_sol']:.6f}")
 
         sweep_csv = args.csv.rsplit(".", 1)[0] + "_sweep.csv"
         df = pd.DataFrame(rows)
@@ -900,11 +915,6 @@ def main():
         print(f"\nSweep results in: {sweep_csv}")
 
         # Print summary table
-        print(f"\n{'thresh':>8s}  {'nodes':>8s}  {'boxes':>8s}  "
-              f"{'Linf':>10s}  {'L1':>10s}  {'L2':>10s}  "
-              f"{'raw':>10s}  {'blosc2':>10s}  "
-              f"{'raw/vdb':>8s}  {'bl2/vdb':>8s}")
-        print("-" * 106)
         def _fmt(val, fmt="{:10d}", na="N/A"):
             try:
                 if pd.isna(val):
@@ -913,6 +923,13 @@ def main():
                 pass
             return fmt.format(val)
 
+        hdr1 = (f"{'thresh':>8s}  {'nodes':>8s}  {'boxes':>8s}  "
+                f"{'err Linf':>10s}  {'err L1':>10s}  {'err L2':>10s}  "
+                f"{'sol Linf':>10s}  {'sol L1':>10s}  {'sol L2':>10s}  "
+                f"{'raw':>10s}  {'blosc2':>10s}  "
+                f"{'raw/vdb':>8s}  {'bl2/vdb':>8s}")
+        print(f"\n{hdr1}")
+        print("-" * len(hdr1))
         for _, r in df.iterrows():
             bl2 = r.get("blosc2_total_bytes", float("nan"))
             raw_ratio = r.get("ratio_raw_vs_vdb", float("nan"))
@@ -924,6 +941,7 @@ def main():
                 f"{r['threshold']:>8s}  "
                 f"{int(r['nodes']):8d}  {int(r['boxes']):8d}  "
                 f"{r['Linf_error']:10.6f}  {r['L1_error']:10.6f}  {r['L2_error']:10.6f}  "
+                f"{r['Linf_sol']:10.6f}  {r['L1_sol']:10.6f}  {r['L2_sol']:10.6f}  "
                 f"{int(r['raw_total_bytes']):10d}  "
                 f"{bl2_s}  {raw_r_s}  {bl2_r_s}"
             )
