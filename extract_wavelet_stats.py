@@ -406,7 +406,7 @@ SWEEP_COLUMNS = [
     "threshold",
     "nodes", "boxes", "topo_bits",
     "n_leaves", "n_nonbg_leaves",
-    "max_error", "mean_abs_error", "rmse",
+    "Linf_error", "L1_error", "L2_error",
     "desc_raw_bytes", "values_raw_bytes", "raw_total_bytes",
     "desc_blosc2_bytes", "values_blosc2_bytes", "blosc2_total_bytes",
     "vdb_orig_file_bytes",
@@ -629,9 +629,14 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
         for entry in reversed(child_entries):
             stack.append(entry)
 
-    row["max_error"] = max_err
-    row["mean_abs_error"] = sum_abs_err / n_voxels if n_voxels else 0.0
-    row["rmse"] = (sum_sq_err / n_voxels) ** 0.5 if n_voxels else 0.0
+    # Function-space norms (volume-weighted, normalized by domain volume |Ω|):
+    #   L_inf = max_x |e(x)|
+    #   L1    = (1/|Ω|) * integral |e| dΩ  =  (1/N) * sum_i |e_i|
+    #   L2    = sqrt( (1/|Ω|) * integral |e|^2 dΩ )  =  sqrt( (1/N) * sum_i |e_i|^2 )
+    # Each voxel has equal volume |Ω|/N, so per-voxel summation is volume-weighted.
+    row["Linf_error"] = max_err
+    row["L1_error"] = sum_abs_err / n_voxels if n_voxels else 0.0
+    row["L2_error"] = (sum_sq_err / n_voxels) ** 0.5 if n_voxels else 0.0
 
     # ── Raw and compressed sizes ──────────────────────────────────────────
     desc_data = open(desc_file, "rb").read()
@@ -656,11 +661,9 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
     # ── VDB reference stats ───────────────────────────────────────────────
     row["vdb_orig_file_bytes"] = vdb_orig_file_bytes
     row["vdb_orig_topo_bits"] = vdb_orig_stats.get("total_topology_bits", float("nan"))
-    row["vdb_orig_active_voxels"] = vdb_orig_stats.get(
-        "active_leaf_voxels", vdb_orig_stats.get("active_voxels", float("nan"))
-    )
+    row["vdb_orig_active_voxels"] = vdb_orig_stats.get("active_leaf_voxels", float("nan"))
     row["vdb_orig_total_coefficients"] = vdb_orig_stats.get(
-        "total_coefficients", float("nan")
+        "total_coefficients", grid.activeVoxelCount()
     )
 
     # Reconstructed VDB file size (if present)
@@ -818,16 +821,64 @@ def main():
 
         # VDB reference stats
         vdb_orig_file_bytes = os.path.getsize(args.vdb)
-        vdb_orig_stats = openvdb_topology_bits(args.vdb)
-        if not vdb_orig_stats:
-            from compare_cloud import vdb_topology_stats_python
-            vdb_orig_stats = vdb_topology_stats_python(grid)
-            vdb_orig_stats["total_topology_bits"] = vdb_orig_stats.get(
-                "total_topo_bits_approx"
-            )
-        print(f"VDB: {vdb_orig_file_bytes:,} bytes, "
-              f"topo={vdb_orig_stats.get('total_topology_bits', '?')} bits, "
-              f"active={vdb_orig_stats.get('active_leaf_voxels', vdb_orig_stats.get('active_voxels', '?'))}")
+        vdb_orig_stats = openvdb_topology_bits(args.vdb) or {}
+
+        # Python-side stats (always available)
+        from compare_cloud import vdb_topology_stats_python
+        py_stats = vdb_topology_stats_python(grid)
+
+        def _v(key, fallback="?"):
+            """Get a value from the C++ tool stats, or '?' if unavailable."""
+            return vdb_orig_stats.get(key, fallback)
+
+        grid_shape = tuple(1 << int(l) for l in per_dim_levels)
+        total_voxels = 1
+        for s in grid_shape:
+            total_voxels *= s
+
+        topo_bits = _v("total_topology_bits")
+        topo_bytes = _v("total_topology_bytes")
+        active_leaf_voxels = _v("active_leaf_voxels")
+        active_tiles = _v("active_tiles")
+        total_coeffs = _v("total_coefficients",
+                          py_stats["active_voxels"])  # fallback: assumes no active tiles
+
+        def _p(label, val, suffix=""):
+            """Print a stat line, formatting ints with commas or showing '?' as-is."""
+            if isinstance(val, int):
+                print(f"  {label:<22s}{val:>12,}{suffix}")
+            else:
+                print(f"  {label:<22s}{str(val):>12}{suffix}")
+
+        print(f"\n--- Original VDB: {args.vdb} ---")
+        _p("File size:", vdb_orig_file_bytes, " bytes")
+        print(f"  Grid name:              {args.grid_name}")
+        print(f"  Background:             {grid.background}")
+        print(f"  Active bbox:            {grid.evalActiveVoxelBoundingBox()}")
+        print(f"  Extent:                 {extent.tolist()}")
+        shape_str = " x ".join(str(s) for s in grid_shape)
+        print(f"  Padded grid:            {shape_str} = {total_voxels:,} voxels")
+        _p("Active leaf voxels:", active_leaf_voxels)
+        _p("Active tiles:", active_tiles)
+        _p("Total coefficients:", total_coeffs)
+        _p("Topology bits:", topo_bits)
+        _p("Topology bytes:", topo_bytes, " bytes")
+        if isinstance(total_coeffs, int):
+            coeff_bits = total_coeffs * 32
+            _p("Value bits (f32):", coeff_bits)
+            if isinstance(topo_bits, int):
+                total_bits = topo_bits + coeff_bits
+                dense_bits = total_voxels * 32
+                _p("Total bits:", total_bits)
+                _p("Dense grid bits:", dense_bits)
+                print(f"  {'VDB vs dense:':<22s}{total_bits / dense_bits:>11.4f}x")
+        # Python-side stats (always available, from pyopenvdb API)
+        print(f"  --- pyopenvdb ---")
+        _p("activeVoxelCount:", py_stats["active_voxels"])
+        _p("Leaf nodes:", py_stats["leaf_count"])
+        _p("Non-leaf nodes:", py_stats["non_leaf_count"])
+        _p("Memory usage:", py_stats["mem_usage_bytes"], " bytes")
+        print(f"  {'Node log2 dims:':<22s}{py_stats['node_log2_dims']}")
         print()
 
         rows = []
@@ -839,7 +890,8 @@ def main():
             )
             rows.append(row)
             print(f" {row['nodes']:,} nodes, {row['boxes']:,} boxes, "
-                  f"max_err={row['max_error']:.6f}")
+                  f"Linf={row['Linf_error']:.6f}, L1={row['L1_error']:.6f}, "
+                  f"L2={row['L2_error']:.6f}")
 
         sweep_csv = args.csv.rsplit(".", 1)[0] + "_sweep.csv"
         df = pd.DataFrame(rows)
@@ -849,7 +901,7 @@ def main():
 
         # Print summary table
         print(f"\n{'thresh':>8s}  {'nodes':>8s}  {'boxes':>8s}  "
-              f"{'max_err':>10s}  {'mae':>10s}  {'rmse':>10s}  "
+              f"{'Linf':>10s}  {'L1':>10s}  {'L2':>10s}  "
               f"{'raw':>10s}  {'blosc2':>10s}  "
               f"{'raw/vdb':>8s}  {'bl2/vdb':>8s}")
         print("-" * 106)
@@ -871,7 +923,7 @@ def main():
             print(
                 f"{r['threshold']:>8s}  "
                 f"{int(r['nodes']):8d}  {int(r['boxes']):8d}  "
-                f"{r['max_error']:10.6f}  {r['mean_abs_error']:10.6f}  {r['rmse']:10.6f}  "
+                f"{r['Linf_error']:10.6f}  {r['L1_error']:10.6f}  {r['L2_error']:10.6f}  "
                 f"{int(r['raw_total_bytes']):10d}  "
                 f"{bl2_s}  {raw_r_s}  {bl2_r_s}"
             )

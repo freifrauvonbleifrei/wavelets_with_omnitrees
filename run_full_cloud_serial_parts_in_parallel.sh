@@ -3,10 +3,10 @@
 
 set -e
 
-VDB="$(pwd)/wdas_cloud/wdas_cloud.vdb"
+VDB="$(pwd)/wdas_cloud/wdas_cloud_sixteenth.vdb"
 MAX_LEVEL=12
-SPLIT_LEVELS="2 2 3 "
-BASE_DIR="$(pwd)/cloud_full_sweep"
+SPLIT_LEVELS="0 0 0"
+BASE_DIR="$(pwd)/cloud_full_sweep_sixteenth"
 CONCURRENCY="${CONCURRENCY:-8}"    
 
 THRESHOLDS=(0 1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 1e-2 )
@@ -34,7 +34,7 @@ run_one_serial() {
         --vdb "$VDB" \
         --workers 1 \
         --max-level "$MAX_LEVEL" \
-        --split-levels "$SPLIT_LEVELS" \
+        --split-levels $SPLIT_LEVELS \
         --threshold "$THR" \
         --skip-serial \
         --work-dir "$WORK_DIR" \
