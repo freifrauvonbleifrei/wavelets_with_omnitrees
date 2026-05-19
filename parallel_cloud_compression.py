@@ -122,21 +122,32 @@ def compress_partition(task):
     n_initial = len(disc.descriptor)
     coefficients = transform_to_all_wavelet_coefficients(disc, leaf_values)
     coeff_list = [list(c) for c in coefficients]
-    disc_ds, coeff_ds, _ = compress_by_downsplit_coarsening(
+    # Extract leaf values for later recomposition
+    root_scaling = coeff_list[0][0]
+    for c in coeff_list:
+        c[0] = np.nan
+
+
+    disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
         disc, coeff_list, coarsening_threshold=threshold
     )
-
-    # Extract leaf values for later recomposition
-    root_scaling = coeff_ds[0][0]
-    coeff_copy = [list(c) for c in coeff_ds]
-    for c in coeff_copy:
-        c[0] = np.nan
+    coeff_copy = [list(c) for c in coeff_can]
     coeff_copy[0][0] = root_scaling
-    out_leaf_values = get_leaf_scalings(disc_ds, coeff_copy)
-
+    can_leaf_values = get_leaf_scalings(disc_can, coeff_copy)
     # Persist descriptor and values
+    disc_can.descriptor.to_file(desc_file.rsplit("_3d.bin", 1)[0] + "_can")
+    vals_pre, vals_suf = vals_file.split(".")
+    np.save(vals_pre + "_can." + vals_suf, can_leaf_values)
+
+    disc_ds, coeff_ds, _ = compress_by_downsplit_coarsening(
+        disc_can, coeff_can, coarsening_threshold=threshold
+    )
+
+    coeff_copy = [list(c) for c in coeff_ds]
+    coeff_copy[0][0] = root_scaling
+    ds_leaf_values = get_leaf_scalings(disc_ds, coeff_copy)
     disc_ds.descriptor.to_file(desc_file.rsplit("_3d.bin", 1)[0])
-    np.save(vals_file, out_leaf_values)
+    np.save(vals_file, ds_leaf_values)
 
     return (
         part_idx,
