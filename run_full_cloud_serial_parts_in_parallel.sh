@@ -9,7 +9,7 @@ SPLIT_LEVELS="0 0 0"
 BASE_DIR="$(pwd)/cloud_full_sweep_sixteenth"
 CONCURRENCY="${CONCURRENCY:-8}"    
 
-THRESHOLDS=(0 1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 1e-2 )
+THRESHOLDS=(0 1e-9 1e-8 1e-7 1e-6 1e-5 1e-4 1e-3 1e-2 )
 
 mkdir -p "$BASE_DIR"
 MASTER_LOG="$BASE_DIR/master_serial_log.txt"

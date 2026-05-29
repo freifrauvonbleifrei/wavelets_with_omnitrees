@@ -559,7 +559,7 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
     import numpy as np
 
     for variant, desc_base, vals_base in (("can", "part00000_can_3d.bin", "part00000_values_can.npy"),("ds","final_3d.bin","final_values.npy")):
-        row = {"threshold": thr_label}
+        row = {"threshold": float(thr_label)}
         row["variant"] = variant
         desc_file = os.path.join(work_dir, desc_base)
         vals_file = os.path.join(work_dir, vals_base)
@@ -940,7 +940,7 @@ def main():
             raw_r_s = _fmt(raw_ratio, "{:7.3f}x", "    N/A")
             bl2_r_s = _fmt(bl2_ratio, "{:7.3f}x", "    N/A")
             print(
-                f"{r['threshold']:>8s}  "
+                f"{r['threshold']}  "
                 f"{int(r['nodes']):8d}  {int(r['boxes']):8d}  "
                 f"{r['Linf_error']:10.6f}  {r['L1_error']:10.6f}  {r['L2_error']:10.6f}  "
                 f"{r['Linf_sol']:10.6f}  {r['L1_sol']:10.6f}  {r['L2_sol']:10.6f}  "
