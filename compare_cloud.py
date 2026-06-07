@@ -584,90 +584,108 @@ def reconstruct_final_vdb(work_dir, source_vdb_path, grid_name="density"):
     has the same world-space coordinate system as the original cloud.
     Returns the path of the written VDB file.
     """
-    import os
+
     meta_path = os.path.join(work_dir, "metadata.json")
     with open(meta_path) as f:
         meta = json.load(f)
     bbox_min = np.array(meta["bbox_min"])
     per_dim_levels = np.array(meta["per_dim_levels"])
 
-    desc_file = os.path.join(work_dir, "final_3d.bin")
-    vals_file = os.path.join(work_dir, "final_values.npy")
-    if not os.path.exists(desc_file) or not os.path.exists(vals_file):
-        raise FileNotFoundError(
-            f"No final descriptor/values in {work_dir} "
-            f"(run the serial compose step first)"
+    for variant, desc_base, vals_base in (
+        ("can", "part00000_can_3d.bin", "part00000_values_can.npy"),
+        ("ds", "final_3d.bin", "final_values.npy"),
+    ):
+        desc_file = os.path.join(work_dir, desc_base)
+        vals_file = os.path.join(work_dir, vals_base)
+        if not os.path.exists(desc_file) or not os.path.exists(vals_file):
+            raise FileNotFoundError(
+                f"No final descriptor/values in {work_dir} "
+                f"(run the serial compose step first)"
+            )
+
+        descriptor = dyada.descriptor.RefinementDescriptor.from_file(desc_file)
+        discretization = dyada.discretization.Discretization(
+            dyada.linearization.MortonOrderLinearization(), descriptor
         )
+        leaf_values = np.load(vals_file)
 
-    descriptor = dyada.descriptor.RefinementDescriptor.from_file(desc_file)
-    discretization = dyada.discretization.Discretization(
-        dyada.linearization.MortonOrderLinearization(), descriptor
-    )
-    leaf_values = np.load(vals_file)
+        source_grid = read_vdb_grid(source_vdb_path, grid_name)
+        background = float(source_grid.background)
+        src_bbox_min, src_bbox_max = source_grid.evalActiveVoxelBoundingBox()
 
-    source_grid = read_vdb_grid(source_vdb_path, grid_name)
-    background = float(source_grid.background)
-    src_bbox_min, src_bbox_max = source_grid.evalActiveVoxelBoundingBox()
+        # Extract the full affine matrix from the source transform via probing,
+        # so rotation / translation are preserved even if direct assignment drops them.
+        xf = source_grid.transform
+        p0 = np.array(xf.indexToWorld((0, 0, 0)))
+        e0 = np.array(xf.indexToWorld((1, 0, 0))) - p0  # index i-axis in world
+        e1 = np.array(xf.indexToWorld((0, 1, 0))) - p0  # index j-axis in world
+        e2 = np.array(xf.indexToWorld((0, 0, 1))) - p0  # index k-axis in world
+        # OpenVDB Mat4d: row-vector-on-left convention  world = [i,j,k,1] * M
+        src_mat4 = [
+            [e0[0], e0[1], e0[2], 0.0],
+            [e1[0], e1[1], e1[2], 0.0],
+            [e2[0], e2[1], e2[2], 0.0],
+            [p0[0], p0[1], p0[2], 1.0],
+        ]
 
-    # Extract the full affine matrix from the source transform via probing,
-    # so rotation / translation are preserved even if direct assignment drops them.
-    xf = source_grid.transform
-    p0 = np.array(xf.indexToWorld((0, 0, 0)))
-    e0 = np.array(xf.indexToWorld((1, 0, 0))) - p0  # index i-axis in world
-    e1 = np.array(xf.indexToWorld((0, 1, 0))) - p0  # index j-axis in world
-    e2 = np.array(xf.indexToWorld((0, 0, 1))) - p0  # index k-axis in world
-    # OpenVDB Mat4d: row-vector-on-left convention  world = [i,j,k,1] * M
-    src_mat4 = [
-        [e0[0], e0[1], e0[2], 0.0],
-        [e1[0], e1[1], e1[2], 0.0],
-        [e2[0], e2[1], e2[2], 0.0],
-        [p0[0], p0[1], p0[2], 1.0],
-    ]
+        grid = omnitree_to_vdb(
+            discretization,
+            leaf_values,
+            per_dim_levels,
+            bbox_min,
+            grid_name=grid_name,
+            background=background,
+        )
+        grid.transform = vdb.createLinearTransform(src_mat4)
 
-    grid = omnitree_to_vdb(
-        discretization, leaf_values, per_dim_levels, bbox_min,
-        grid_name=grid_name, background=background,
-    )
-    grid.transform = vdb.createLinearTransform(src_mat4)
+        # Crop to the source grid's active bounding box
+        out_min, out_max = grid.evalActiveVoxelBoundingBox()
+        for dim in range(3):
+            if out_min[dim] < src_bbox_min[dim]:
+                lo = list(out_min)
+                hi = list(out_max)
+                hi[dim] = src_bbox_min[dim] - 1
+                grid.fill(tuple(lo), tuple(hi), background, active=False)
+            if out_max[dim] > src_bbox_max[dim]:
+                lo = list(out_min)
+                hi = list(out_max)
+                lo[dim] = src_bbox_max[dim] + 1
+                grid.fill(tuple(lo), tuple(hi), background, active=False)
 
-    # Crop to the source grid's active bounding box
-    out_min, out_max = grid.evalActiveVoxelBoundingBox()
-    for dim in range(3):
-        if out_min[dim] < src_bbox_min[dim]:
-            lo = list(out_min)
-            hi = list(out_max)
-            hi[dim] = src_bbox_min[dim] - 1
-            grid.fill(tuple(lo), tuple(hi), background, active=False)
-        if out_max[dim] > src_bbox_max[dim]:
-            lo = list(out_min)
-            hi = list(out_max)
-            lo[dim] = src_bbox_max[dim] + 1
-            grid.fill(tuple(lo), tuple(hi), background, active=False)
-
-    out_path = os.path.join(work_dir, "final.vdb")
-    vdb.write(out_path, grids=[grid])
-    desc_stats = descriptor_stats(descriptor)
-    print(f"  {out_path}: {desc_stats['nodes']:,} nodes, "
-          f"{desc_stats['boxes']:,} boxes, {len(leaf_values):,} leaves, "
-          f"{os.path.getsize(out_path):,} bytes")
+        out_path = os.path.join(work_dir, f"final_{variant}.vdb")
+        vdb.write(out_path, grids=[grid])
+        desc_stats = descriptor_stats(descriptor)
+        print(
+            f"  {out_path}: {desc_stats['nodes']:,} nodes, "
+            f"{desc_stats['boxes']:,} boxes, {len(leaf_values):,} leaves, "
+            f"{os.path.getsize(out_path):,} bytes"
+        )
     return out_path
 
 
 def reconstruct_main():
     """CLI for reconstructing VDB files from a threshold sweep."""
-    import os, glob
+    import glob
+
     parser = argparse.ArgumentParser(
         description="Reconstruct VDB files from parallel cloud sweep results.",
     )
-    parser.add_argument("source_vdb",
-                        help="Original VDB file (used for coordinate transform)")
-    parser.add_argument("sweep_dir",
-                        help="Base directory containing thr_* work directories")
-    parser.add_argument("--grid", default="density",
-                        help="VDB grid name (default: density)")
-    parser.add_argument("--thresholds", nargs="+", default=None,
-                        help="Specific thresholds to reconstruct "
-                        "(default: all thr_* dirs that have final results)")
+    parser.add_argument(
+        "source_vdb", help="Original VDB file (used for coordinate transform)"
+    )
+    parser.add_argument(
+        "sweep_dir", help="Base directory containing thr_* work directories"
+    )
+    parser.add_argument(
+        "--grid", default="density", help="VDB grid name (default: density)"
+    )
+    parser.add_argument(
+        "--thresholds",
+        nargs="+",
+        default=None,
+        help="Specific thresholds to reconstruct "
+        "(default: all thr_* dirs that have final results)",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.source_vdb):
@@ -677,8 +695,9 @@ def reconstruct_main():
 
     # Discover threshold directories
     if args.thresholds:
-        work_dirs = [(t, os.path.join(args.sweep_dir, f"thr_{t}"))
-                     for t in args.thresholds]
+        work_dirs = [
+            (t, os.path.join(args.sweep_dir, f"thr_{t}")) for t in args.thresholds
+        ]
     else:
         work_dirs = []
         for d in sorted(glob.glob(os.path.join(args.sweep_dir, "thr_*"))):
