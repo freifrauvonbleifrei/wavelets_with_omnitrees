@@ -11,7 +11,9 @@ Usage:
     python extract_wavelet_stats.py [--dir output/] [--csv wavelet_stats.csv]
 """
 import argparse
+import bitarray as ba
 import json
+import numpy as np
 import os
 import re
 import subprocess
@@ -23,7 +25,9 @@ import pandas as pd
 from filelock import FileLock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+)
 
 from dyada import Discretization, MortonOrderLinearization, RefinementDescriptor
 
@@ -166,9 +170,6 @@ def openvdb_topology_bits(vdb_file):
     return stats if stats else None
 
 
-
-
-
 def _sample_leaf_values_from_vdb(disc, vdb_path, level):
     """Sample the VDB BoolGrid at a finest-level midpoint within each leaf.
 
@@ -178,7 +179,6 @@ def _sample_leaf_values_from_vdb(disc, vdb_path, level):
 
     Returns a bitarray of length n_boxes with 1 for inside, 0 for outside.
     """
-    import bitarray as ba
     import openvdb as vdb
 
     grids, _ = vdb.readAll(vdb_path)
@@ -192,7 +192,6 @@ def _sample_leaf_values_from_vdb(disc, vdb_path, level):
     values.setall(0)
 
     # Build subtree-end array for O(1) sibling skipping
-    import numpy as np
     n = len(descriptor)
     subtree_end = np.empty(n, dtype=np.int64)
     for i in range(n - 1, -1, -1):
@@ -235,9 +234,12 @@ def _sample_leaf_values_from_vdb(disc, vdb_path, level):
             for d in range(3):
                 if ref[d]:
                     if (child_idx >> local_bit) & 1:
-                        if d == 0: cox += csx
-                        elif d == 1: coy += csy
-                        else: coz += csz
+                        if d == 0:
+                            cox += csx
+                        elif d == 1:
+                            coy += csy
+                        else:
+                            coz += csz
                     local_bit += 1
             child_entries.append((child_desc, cox, coy, coz, csx, csy, csz))
             child_desc = int(subtree_end[child_desc])
@@ -248,8 +250,7 @@ def _sample_leaf_values_from_vdb(disc, vdb_path, level):
     return values
 
 
-def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
-                              level: int = None) -> dict:
+def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str, level: int) -> dict:
     """Write binary coefficients and compress both descriptor and coefficients.
 
     Samples actual leaf occupancy values from the VDB BoolGrid.  If the VDB
@@ -262,7 +263,6 @@ def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
 
     Returns dict with raw / blosc2 descriptor, coefficient, and total bytes.
     """
-    import bitarray as ba
 
     disc = load_descriptor(descriptor_path)
     n_boxes = disc.descriptor.get_num_boxes()
@@ -301,6 +301,7 @@ def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
     # Blosc2 compression (optional)
     try:
         import blosc2
+
         desc_blosc2 = blosc2.compress(desc_data, typesize=1)
         coeffs_blosc2 = blosc2.compress(coeffs_data, typesize=1)
         with open(descriptor_path + ".blosc2", "wb") as f:
@@ -316,8 +317,9 @@ def compressed_omnitree_sizes(descriptor_path: str, vdb_path: str = None,
     return result
 
 
-def compressed_cloud_sizes(descriptor_path: str, values_path: str,
-                           mask_path: str) -> dict:
+def compressed_cloud_sizes(
+    descriptor_path: str, values_path: str, mask_path: str
+) -> dict:
     """Compress real-valued cloud omnitree data (descriptor + values + mask).
 
     The cloud representation stores:
@@ -327,8 +329,6 @@ def compressed_cloud_sizes(descriptor_path: str, values_path: str,
 
     Returns dict with raw and blosc2 total sizes.
     """
-    import numpy as np
-
     desc_data = open(descriptor_path, "rb").read()
     values_data = np.load(values_path).astype(np.float32).tobytes()
     mask_data = np.load(mask_path).tobytes()
@@ -343,6 +343,7 @@ def compressed_cloud_sizes(descriptor_path: str, values_path: str,
 
     try:
         import blosc2
+
         d_c = blosc2.compress(desc_data, typesize=1)
         v_c = blosc2.compress(values_data, typesize=4)
         m_c = blosc2.compress(mask_data, typesize=1)
@@ -358,12 +359,8 @@ def discover_cloud_files(directory):
 
     Returns dict keyed by (grid_name, threshold, variant) with file paths.
     """
-    pattern = re.compile(
-        r"^(cloud_l[\dx]+)_t([\d.]+)_(\w+)_3d\.bin$"
-    )
-    octree_pattern = re.compile(
-        r"^(cloud_l[\dx]+)_(octree)_3d\.bin$"
-    )
+    pattern = re.compile(r"^(cloud_l[\dx]+)_t([\d.]+)_(\w+)_3d\.bin$")
+    octree_pattern = re.compile(r"^(cloud_l[\dx]+)_(octree)_3d\.bin$")
     entries = {}
     for f in os.listdir(directory):
         m = pattern.match(f) or octree_pattern.match(f)
@@ -395,9 +392,14 @@ def discover_cloud_files(directory):
 
 
 CLOUD_COLUMNS = [
-    "grid_name", "threshold", "variant",
-    "nodes", "boxes", "topo_bits",
-    "raw_total_bytes", "blosc2_total_bytes",
+    "grid_name",
+    "threshold",
+    "variant",
+    "nodes",
+    "boxes",
+    "topo_bits",
+    "raw_total_bytes",
+    "blosc2_total_bytes",
     "vdb_file_bytes",
     "n_nonbg_values",
 ]
@@ -405,46 +407,31 @@ CLOUD_COLUMNS = [
 SWEEP_COLUMNS = [
     "threshold",
     "variant",
-    "nodes", "boxes", "topo_bits",
-    "n_leaves", "n_nonbg_leaves",
-    "Linf_error", "L1_error", "L2_error",
-    "Linf_sol", "L1_sol", "L2_sol",
-    "desc_raw_bytes", "values_raw_bytes", "raw_total_bytes",
-    "desc_blosc2_bytes", "values_blosc2_bytes", "blosc2_total_bytes",
+    "nodes",
+    "boxes",
+    "topo_bits",
+    "n_leaves",
+    "n_nonbg_leaves",
+    "Linf_error",
+    "L1_error",
+    "L2_error",
+    "Linf_sol",
+    "L1_sol",
+    "L2_sol",
+    "desc_raw_bytes",
+    "values_raw_bytes",
+    "raw_total_bytes",
+    "desc_blosc2_bytes",
+    "values_blosc2_bytes",
+    "blosc2_total_bytes",
     "vdb_orig_file_bytes",
-    "vdb_orig_topo_bits", "vdb_orig_active_voxels", "vdb_orig_total_coefficients",
+    "vdb_orig_topo_bits",
+    "vdb_orig_active_voxels",
+    "vdb_orig_total_coefficients",
     "vdb_recon_file_bytes",
-    "ratio_raw_vs_vdb", "ratio_blosc2_vs_vdb",
+    "ratio_raw_vs_vdb",
+    "ratio_blosc2_vs_vdb",
 ]
-
-
-def process_cloud(grid_name, threshold, variant, files):
-    """Extract stats for one cloud variant."""
-    import numpy as np
-
-    row = {
-        "grid_name": grid_name,
-        "threshold": threshold,
-        "variant": variant,
-    }
-
-    disc = load_descriptor(files["descriptor"])
-    s = descriptor_stats(disc)
-    row["nodes"] = s["nodes"]
-    row["boxes"] = s["boxes"]
-    row["topo_bits"] = s["topo_bits"]
-
-    vals = np.load(files["values"])
-    row["n_nonbg_values"] = len(vals)
-
-    cs = compressed_cloud_sizes(files["descriptor"], files["values"], files["mask"])
-    row["raw_total_bytes"] = cs["raw_total_bytes"]
-    row["blosc2_total_bytes"] = cs["blosc2_total_bytes"]
-
-    if files.get("vdb"):
-        row["vdb_file_bytes"] = os.path.getsize(files["vdb"])
-
-    return row
 
 
 def discover_files(directory):
@@ -517,7 +504,7 @@ def process_one(thingi_id, level, files):
         row["ds_desc_blosc2_bytes"] = cs["blosc2_descriptor_bytes"]
         row["ds_coeffs_raw_bytes"] = cs["raw_coeffs_bytes"]
         row["ds_coeffs_blosc2_bytes"] = cs["blosc2_coeffs_bytes"]
-    
+
     # OpenVDB (all stats from the C++ vdb_topology_bits tool)
     if "openvdb" in files:
         row["vdb_file_bytes"] = os.path.getsize(files["openvdb"])
@@ -531,7 +518,9 @@ def process_one(thingi_id, level, files):
             row["vdb_active_leaf"] = vdb_stats.get("active_leaf_voxels")
             row["vdb_inactive_leaf"] = vdb_stats.get("inactive_leaf_voxels")
             row["vdb_active_tiles"] = vdb_stats.get("active_tiles")
-            row["vdb_total_leaf_coefficients"] = vdb_stats.get("total_leaf_coefficients")
+            row["vdb_total_leaf_coefficients"] = vdb_stats.get(
+                "total_leaf_coefficients"
+            )
             row["vdb_total_coefficients"] = vdb_stats.get("total_coefficients")
 
     return row
@@ -540,6 +529,7 @@ def process_one(thingi_id, level, files):
 def discover_sweep_dirs(sweep_dir):
     """Discover thr_* directories with final_3d.bin + final_values.npy."""
     import glob
+
     dirs = []
     for d in sorted(glob.glob(os.path.join(sweep_dir, "thr_*"))):
         if not os.path.isdir(d):
@@ -553,22 +543,31 @@ def discover_sweep_dirs(sweep_dir):
     return dirs
 
 
-def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
-                            vdb_orig_file_bytes, vdb_orig_stats):
+def process_sweep_threshold(
+    thr_label,
+    work_dir,
+    grid,
+    bbox_min,
+    per_dim_levels,
+    vdb_orig_file_bytes,
+    vdb_orig_stats,
+):
     """Extract stats for one threshold in a cloud sweep."""
-    import numpy as np
 
-    for variant, desc_base, vals_base in (("can", "part00000_can_3d.bin", "part00000_values_can.npy"),("ds","final_3d.bin","final_values.npy")):
+    for variant, desc_base, vals_base in (
+        ("can", "part00000_can_3d.bin", "part00000_values_can.npy"),
+        ("ds", "final_3d.bin", "final_values.npy"),
+    ):
         row = {"threshold": float(thr_label)}
         row["variant"] = variant
         desc_file = os.path.join(work_dir, desc_base)
         vals_file = os.path.join(work_dir, vals_base)
-    
+
         desc = RefinementDescriptor.from_file(desc_file)
         disc = Discretization(MortonOrderLinearization(), desc)
         leaf_values = np.load(vals_file)
         background = float(grid.background)
-    
+
         n_nodes = len(desc)
         n_boxes = desc.get_num_boxes()
         row["nodes"] = n_nodes
@@ -576,13 +575,14 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
         row["topo_bits"] = n_nodes * DIMENSIONALITY
         row["n_leaves"] = n_boxes
         row["n_nonbg_leaves"] = int(np.count_nonzero(leaf_values != background))
-    
+
         # ── Error vs original VDB ─────────────────────────────────────────────
         from compare_cloud import _build_subtree_end
+
         grid_shape = tuple(1 << int(l) for l in per_dim_levels)
         gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
         subtree_end = _build_subtree_end(desc)
-    
+
         max_err = 0.0
         sum_abs_err = 0.0
         sum_sq_err = 0.0
@@ -590,13 +590,13 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
         sum_abs_sol = 0.0
         sum_sq_sol = 0.0
         n_voxels = 0
-    
+
         stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
         leaf_idx = 0
         while stack:
             desc_i, ox, oy, oz, sx, sy, sz = stack.pop()
             ref = desc[desc_i]
-    
+
             if ref.count() == 0:
                 val = float(leaf_values[leaf_idx])
                 leaf_idx += 1
@@ -617,12 +617,15 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
                 sum_sq_sol += val * val * count
                 n_voxels += count
                 continue
-    
+
             csx, csy, csz = sx, sy, sz
-            if ref[0]: csx //= 2
-            if ref[1]: csy //= 2
-            if ref[2]: csz //= 2
-    
+            if ref[0]:
+                csx //= 2
+            if ref[1]:
+                csy //= 2
+            if ref[2]:
+                csz //= 2
+
             num_children = 1 << ref.count()
             child_desc = desc_i + 1
             child_entries = []
@@ -632,15 +635,18 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
                 for d in range(3):
                     if ref[d]:
                         if (child_idx >> local_bit) & 1:
-                            if d == 0: cox += csx
-                            elif d == 1: coy += csy
-                            else: coz += csz
+                            if d == 0:
+                                cox += csx
+                            elif d == 1:
+                                coy += csy
+                            else:
+                                coz += csz
                         local_bit += 1
                 child_entries.append((child_desc, cox, coy, coz, csx, csy, csz))
                 child_desc = int(subtree_end[child_desc])
             for entry in reversed(child_entries):
                 stack.append(entry)
-    
+
         # Function-space norms (volume-weighted, normalized by domain volume |Ω|):
         #   L_inf = max_x |e(x)|
         #   L1    = (1/|Ω|) * integral |e| dΩ  =  (1/N) * sum_i |e_i|
@@ -652,17 +658,18 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
         row["Linf_sol"] = max_sol
         row["L1_sol"] = sum_abs_sol / n_voxels if n_voxels else 0.0
         row["L2_sol"] = (sum_sq_sol / n_voxels) ** 0.5 if n_voxels else 0.0
-    
+
         # ── Raw and compressed sizes ──────────────────────────────────────────
         desc_data = open(desc_file, "rb").read()
         values_data = leaf_values.astype(np.float32).tobytes()
-    
+
         row["desc_raw_bytes"] = len(desc_data)
         row["values_raw_bytes"] = len(values_data)
         row["raw_total_bytes"] = len(desc_data) + len(values_data)
-    
+
         try:
             import blosc2
+
             d_c = blosc2.compress(desc_data, typesize=1)
             v_c = blosc2.compress(values_data, typesize=4)
             row["desc_blosc2_bytes"] = len(d_c)
@@ -672,15 +679,19 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
             row["desc_blosc2_bytes"] = float("nan")
             row["values_blosc2_bytes"] = float("nan")
             row["blosc2_total_bytes"] = float("nan")
-    
+
         # ── VDB reference stats ───────────────────────────────────────────────
         row["vdb_orig_file_bytes"] = vdb_orig_file_bytes
-        row["vdb_orig_topo_bits"] = vdb_orig_stats.get("total_topology_bits", float("nan"))
-        row["vdb_orig_active_voxels"] = vdb_orig_stats.get("active_leaf_voxels", float("nan"))
+        row["vdb_orig_topo_bits"] = vdb_orig_stats.get(
+            "total_topology_bits", float("nan")
+        )
+        row["vdb_orig_active_voxels"] = vdb_orig_stats.get(
+            "active_leaf_voxels", float("nan")
+        )
         row["vdb_orig_total_coefficients"] = vdb_orig_stats.get(
             "total_coefficients", grid.activeVoxelCount()
         )
-    
+
         # Reconstructed VDB file size (if present)
         recon_vdb = None
         for name in ("final.vdb",):
@@ -691,17 +702,24 @@ def process_sweep_threshold(thr_label, work_dir, grid, bbox_min, per_dim_levels,
         # Also check for final_thr_*.vdb or final_perm*.vdb
         if recon_vdb is None:
             import glob
+
             candidates = glob.glob(os.path.join(work_dir, "final*.vdb"))
             if candidates:
                 recon_vdb = candidates[0]
-        row["vdb_recon_file_bytes"] = os.path.getsize(recon_vdb) if recon_vdb else float("nan")
-    
+        row["vdb_recon_file_bytes"] = (
+            os.path.getsize(recon_vdb) if recon_vdb else float("nan")
+        )
+
         # Compression ratios
         vdb_bytes = vdb_orig_file_bytes
-        row["ratio_raw_vs_vdb"] = row["raw_total_bytes"] / vdb_bytes if vdb_bytes else float("nan")
+        row["ratio_raw_vs_vdb"] = (
+            row["raw_total_bytes"] / vdb_bytes if vdb_bytes else float("nan")
+        )
         blosc2 = row.get("blosc2_total_bytes", float("nan"))
-        row["ratio_blosc2_vs_vdb"] = blosc2 / vdb_bytes if vdb_bytes and not pd.isna(blosc2) else float("nan")
-    
+        row["ratio_blosc2_vs_vdb"] = (
+            blosc2 / vdb_bytes if vdb_bytes and not pd.isna(blosc2) else float("nan")
+        )
+
         yield row
 
 
@@ -713,11 +731,6 @@ def main():
         "--dir",
         default=None,
         help="Directory containing thingi10k .bin and .vdb files",
-    )
-    parser.add_argument(
-        "--cloud-dir",
-        default=None,
-        help="Directory containing cloud output files (_3d.bin, _values.npy, _nonbg_mask.npy)",
     )
     parser.add_argument(
         "--sweep-dir",
@@ -742,8 +755,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.dir is None and args.cloud_dir is None and args.sweep_dir is None:
-        parser.error("at least one of --dir, --cloud-dir, or --sweep-dir is required")
+    if args.dir is None and args.sweep_dir is None:
+        parser.error("at least one of --dir or --sweep-dir is required")
     if args.sweep_dir is not None and args.vdb is None:
         parser.error("--vdb is required with --sweep-dir")
 
@@ -763,7 +776,11 @@ def main():
                 n_skipped += 1
                 continue
 
-            stages = [k for k in ("canonical", "pushdown", "downsplit", "openvdb") if k in files]
+            stages = [
+                k
+                for k in ("canonical", "pushdown", "downsplit", "openvdb")
+                if k in files
+            ]
             print(f"  thingi={thingi_id}, level={level}: {', '.join(stages)}")
 
             row = process_one(thingi_id, level, files)
@@ -773,45 +790,8 @@ def main():
         print(f"\nDone: {n_processed} processed, {n_skipped} skipped (already in CSV).")
         print(f"Results in: {args.csv}")
 
-    # ── Cloud real-valued stats ────────────────────────────────────────────
-    if args.cloud_dir is not None:
-        cloud_entries = discover_cloud_files(args.cloud_dir)
-        if not cloud_entries:
-            print(f"No cloud files found in {args.cloud_dir}/")
-            return
-
-        cloud_csv = args.csv.rsplit(".", 1)[0] + "_cloud.csv"
-        print(f"\nFound {len(cloud_entries)} cloud variants in {args.cloud_dir}/")
-
-        rows = []
-        for (grid_name, threshold, variant), files in sorted(cloud_entries.items()):
-            print(f"  {grid_name} t={threshold} {variant}")
-            row = process_cloud(grid_name, threshold, variant, files)
-            rows.append(row)
-
-        df = pd.DataFrame(rows)
-        df = df.reindex(columns=CLOUD_COLUMNS)
-        df.to_csv(cloud_csv, index=False)
-        print(f"\nCloud results in: {cloud_csv}")
-
-        # Print summary
-        print(f"\n{'grid':>18s}  {'thresh':>6s}  {'variant':>10s}  "
-              f"{'nodes':>8s}  {'boxes':>8s}  "
-              f"{'raw':>10s}  {'blosc2':>10s}  {'vdb_file':>10s}  {'blosc2/vdb':>10s}")
-        print("-" * 100)
-        for _, r in df.iterrows():
-            vdb = r.get("vdb_file_bytes", float("nan"))
-            ratio = r["blosc2_total_bytes"] / vdb if pd.notna(vdb) and vdb > 0 else float("nan")
-            print(f"{r['grid_name']:>18s}  {r['threshold']:>6s}  {r['variant']:>10s}  "
-                  f"{int(r['nodes']):8d}  {int(r['boxes']):8d}  "
-                  f"{int(r['raw_total_bytes']):10d}  "
-                  f"{int(r['blosc2_total_bytes']) if pd.notna(r['blosc2_total_bytes']) else 'N/A':>10}  "
-                  f"{int(vdb) if pd.notna(vdb) else 'N/A':>10}  "
-                  f"{ratio:9.3f}x" if pd.notna(ratio) else "")
-
     # ── Cloud sweep stats (--sweep-dir) ───────────────────────────────────
     if args.sweep_dir is not None:
-        import numpy as np
         from compare_cloud import read_vdb_grid, vdb_grid_extent, levels_from_extent
 
         sweep_dirs = discover_sweep_dirs(args.sweep_dir)
@@ -832,7 +812,9 @@ def main():
             meta = json.load(f)
         per_dim_levels = np.array(meta["per_dim_levels"])
         bbox_min = np.array(meta["bbox_min"])
-        print(f"Grid: bbox_min={bbox_min.tolist()}, per_dim_levels={per_dim_levels.tolist()}")
+        print(
+            f"Grid: bbox_min={bbox_min.tolist()}, per_dim_levels={per_dim_levels.tolist()}"
+        )
 
         # VDB reference stats
         vdb_orig_file_bytes = os.path.getsize(args.vdb)
@@ -840,6 +822,7 @@ def main():
 
         # Python-side stats (always available)
         from compare_cloud import vdb_topology_stats_python
+
         py_stats = vdb_topology_stats_python(grid)
 
         def _v(key, fallback="?"):
@@ -855,8 +838,9 @@ def main():
         topo_bytes = _v("total_topology_bytes")
         active_leaf_voxels = _v("active_leaf_voxels")
         active_tiles = _v("active_tiles")
-        total_coeffs = _v("total_coefficients",
-                          py_stats["active_voxels"])  # fallback: assumes no active tiles
+        total_coeffs = _v(
+            "total_coefficients", py_stats["active_voxels"]
+        )  # fallback: assumes no active tiles
 
         def _p(label, val, suffix=""):
             """Print a stat line, formatting ints with commas or showing '?' as-is."""
@@ -900,15 +884,22 @@ def main():
         for thr_label, work_dir in sweep_dirs:
             print(f"  thr={thr_label} ...", end="", flush=True)
             for row in process_sweep_threshold(
-                thr_label, work_dir, grid, bbox_min, per_dim_levels,
-                vdb_orig_file_bytes, vdb_orig_stats,
-                ):
+                thr_label,
+                work_dir,
+                grid,
+                bbox_min,
+                per_dim_levels,
+                vdb_orig_file_bytes,
+                vdb_orig_stats,
+            ):
                 rows.append(row)
-                print(f" {row['nodes']:,} nodes, {row['boxes']:,} boxes, "
-                  f"err Linf={row['Linf_error']:.6f} L1={row['L1_error']:.6f} "
-                  f"L2={row['L2_error']:.6f}, "
-                  f"sol Linf={row['Linf_sol']:.6f} L1={row['L1_sol']:.6f} "
-                  f"L2={row['L2_sol']:.6f}")
+                print(
+                    f" {row['nodes']:,} nodes, {row['boxes']:,} boxes, "
+                    f"err Linf={row['Linf_error']:.6f} L1={row['L1_error']:.6f} "
+                    f"L2={row['L2_error']:.6f}, "
+                    f"sol Linf={row['Linf_sol']:.6f} L1={row['L1_sol']:.6f} "
+                    f"L2={row['L2_sol']:.6f}"
+                )
 
         sweep_csv = args.csv.rsplit(".", 1)[0] + "_sweep.csv"
         df = pd.DataFrame(rows)
@@ -925,11 +916,13 @@ def main():
                 pass
             return fmt.format(val)
 
-        hdr1 = (f"{'thresh':>8s}  {'nodes':>8s}  {'boxes':>8s}  "
-                f"{'err Linf':>10s}  {'err L1':>10s}  {'err L2':>10s}  "
-                f"{'sol Linf':>10s}  {'sol L1':>10s}  {'sol L2':>10s}  "
-                f"{'raw':>10s}  {'blosc2':>10s}  "
-                f"{'raw/vdb':>8s}  {'bl2/vdb':>8s}")
+        hdr1 = (
+            f"{'thresh':>8s}  {'nodes':>8s}  {'boxes':>8s}  "
+            f"{'err Linf':>10s}  {'err L1':>10s}  {'err L2':>10s}  "
+            f"{'sol Linf':>10s}  {'sol L1':>10s}  {'sol L2':>10s}  "
+            f"{'raw':>10s}  {'blosc2':>10s}  "
+            f"{'raw/vdb':>8s}  {'bl2/vdb':>8s}"
+        )
         print(f"\n{hdr1}")
         print("-" * len(hdr1))
         for _, r in df.iterrows():
