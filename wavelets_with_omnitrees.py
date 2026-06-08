@@ -371,7 +371,7 @@ def _coarsening_round(
             parent_coefficients = coefficients[desc_i]
             branch_level = node_levels[desc_i].astype(np.int64)
             box_volume = float(np.prod(np.power(2.0, -branch_level)))
-            local_bound = coarsening_threshold / box_volume
+            local_bound = coarsening_threshold
 
             if all(
                 abs(parent_coefficients[j]) <= local_bound for j in range(1, 1 << k)
@@ -478,18 +478,17 @@ def compress_by_omnitree_coarsening(
     # arrays without aliasing the input.
     coefficients = [np.asarray(c, dtype=np.float64).copy() for c in coefficients]
 
-    for phase_threshold in (0.0, coarsening_threshold):
-        while True:
-            discretization, coefficients, changed, round_discarded = _coarsening_round(
-                discretization,
-                coefficients,
-                phase_threshold,
-                num_dimensions,
-                allow_partial=True,
-            )
-            total_discarded += round_discarded
-            if not changed:
-                break
+    while True:
+        discretization, coefficients, changed, round_discarded = _coarsening_round(
+            discretization,
+            coefficients,
+            coarsening_threshold,
+            num_dimensions,
+            allow_partial=True,
+        )
+        total_discarded += round_discarded
+        if not changed:
+            break
 
     return discretization, coefficients, total_discarded
 
@@ -1093,6 +1092,7 @@ def compress_by_downsplit_coarsening(
             coefficients,
             coarsening_threshold,
             num_dimensions,
+            allow_partial=True,
         )
         total_discarded_l1 += round_discarded
 
@@ -1339,6 +1339,7 @@ def compress_by_downsplit_coarsening_decomposed(
     """
     # load lazily -- currently not in dyada main
     from dyada.descriptor_builder import compose_descriptors, decompose_descriptor
+
     linearization = discretization._linearization
     num_dimensions = discretization.descriptor.get_num_dimensions()
     total_discarded_l1 = 0.0
@@ -1426,9 +1427,7 @@ def compress_by_downsplit_coarsening_decomposed(
                 np.asarray(coefficients[j], dtype=np.float64).copy()
                 for j in range(ci, ce)
             ]
-            sub_disc = dyada.discretization.Discretization(
-                linearization, sub_descs[k]
-            )
+            sub_disc = dyada.discretization.Discretization(linearization, sub_descs[k])
             push = push_of[ci]
             if push is None:
                 # Single-dim cut: skip downsplit, go straight to coarsening.
@@ -1450,6 +1449,7 @@ def compress_by_downsplit_coarsening_decomposed(
                     coarsening_threshold,
                     num_dimensions,
                     base_level=source_node_levels[ci],
+                    allow_partial=True,
                 )
                 if not planned_any:
                     break
@@ -1498,9 +1498,9 @@ def compress_by_downsplit_coarsening_decomposed(
             sub_map = compose_sub_maps[box_idx]
             for sub_i, combined_i_set in enumerate(sub_map):
                 new_coefficients[next(iter(combined_i_set))] = sub_c[sub_i]
-        assert all(c is not None for c in new_coefficients), (
-            "coefficient reassembly left unfilled slots"
-        )
+        assert all(
+            c is not None for c in new_coefficients
+        ), "coefficient reassembly left unfilled slots"
 
         # ── 7. Build the next round's dirty mask. ────────────────────────
         new_dirty = ba.bitarray(len(combined_desc))
@@ -1536,7 +1536,9 @@ def compress_by_downsplit_coarsening_decomposed(
                     new_dirty[next(iter(combined_i_set))] = dirty[ci + sub_i]
 
         # ── 8. Commit. ──────────────────────────────────────────────────
-        discretization = dyada.discretization.Discretization(linearization, combined_desc)
+        discretization = dyada.discretization.Discretization(
+            linearization, combined_desc
+        )
         coefficients = new_coefficients
         dirty = new_dirty
 
