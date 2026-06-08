@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import bitarray as ba
+from itertools import product
 import json
 import numpy as np
 import os
@@ -547,24 +548,32 @@ def process_sweep_threshold(
     thr_label,
     work_dir,
     grid,
+    grid_name,
     bbox_min,
     per_dim_levels,
     vdb_orig_file_bytes,
     vdb_orig_stats,
 ):
     """Extract stats for one threshold in a cloud sweep."""
+    from wavelets_with_omnitrees import read_vdb_grid
 
-    for variant, desc_base, vals_base in (
-        ("can", "part00000_can_3d.bin", "part00000_values_can.npy"),
-        ("ds", "final_3d.bin", "final_values.npy"),
+    for variant, desc_base, vals_base, vdb_base in (
+        (
+            "can",
+            "part00000_can_3d.bin",
+            "part00000_values_can.npy",
+            "final_can_thr_{thr_label}.vdb",
+        ),
+        ("ds", "final_3d.bin", "final_values.npy", f"final_ds_thr_{thr_label}.vdb"),
     ):
         row = {"threshold": float(thr_label)}
         row["variant"] = variant
         desc_file = os.path.join(work_dir, desc_base)
         vals_file = os.path.join(work_dir, vals_base)
+        vdb_from_omni_file = os.path.join(work_dir, vdb_base)
+        grid_from_omni = read_vdb_grid(vdb_from_omni_file, grid_name)
 
         desc = RefinementDescriptor.from_file(desc_file)
-        disc = Discretization(MortonOrderLinearization(), desc)
         leaf_values = np.load(vals_file)
         background = float(grid.background)
 
@@ -573,15 +582,7 @@ def process_sweep_threshold(
         row["nodes"] = n_nodes
         row["boxes"] = n_boxes
         row["topo_bits"] = n_nodes * DIMENSIONALITY
-        row["n_leaves"] = n_boxes
         row["n_nonbg_leaves"] = int(np.count_nonzero(leaf_values != background))
-
-        # ── Error vs original VDB ─────────────────────────────────────────────
-        from compare_cloud import _build_subtree_end
-
-        grid_shape = tuple(1 << int(l) for l in per_dim_levels)
-        gx, gy, gz = int(bbox_min[0]), int(bbox_min[1]), int(bbox_min[2])
-        subtree_end = _build_subtree_end(desc)
 
         max_err = 0.0
         sum_abs_err = 0.0
@@ -591,67 +592,28 @@ def process_sweep_threshold(
         sum_sq_sol = 0.0
         n_voxels = 0
 
-        stack = [(0, 0, 0, 0, grid_shape[0], grid_shape[1], grid_shape[2])]
-        leaf_idx = 0
-        while stack:
-            desc_i, ox, oy, oz, sx, sy, sz = stack.pop()
-            ref = desc[desc_i]
+        # compare vdb from omni to reference vdb
+        # for this, iterate the whole bounding box
+        bbox_ranges = [
+            range(bbox_min[d], bbox_min[d] + (1 << per_dim_levels[d])) for d in range(3)
+        ]
+        ref_accessor = grid.getAccessor()
+        from_omni_accessor = grid_from_omni.getAccessor()
+        for x, y, z in product(*bbox_ranges):
+            ref = ref_accessor.getValue((x, y, z))
+            from_omni = from_omni_accessor.getValue((x, y, z))
+            err = abs(ref - from_omni)
+            sol = abs(from_omni - background)
 
-            if ref.count() == 0:
-                val = float(leaf_values[leaf_idx])
-                leaf_idx += 1
-                buf = np.full((sx, sy, sz), background, dtype=np.float32)
-                grid.copyToArray(buf, ijk=(gx + ox, gy + oy, gz + oz))
-                diff = np.abs(buf - val)
-                err = float(diff.max())
-                if err > max_err:
-                    max_err = err
-                count = sx * sy * sz
-                sum_abs_err += float(diff.sum())
-                sum_sq_err += float((diff * diff).sum())
-                # Solution norms (piecewise-constant reconstruction)
-                abs_val = abs(val)
-                if abs_val > max_sol:
-                    max_sol = abs_val
-                sum_abs_sol += abs_val * count
-                sum_sq_sol += val * val * count
-                n_voxels += count
-                continue
+            max_err = max(max_err, err)
+            sum_abs_err += err
+            sum_sq_err += err * err
 
-            csx, csy, csz = sx, sy, sz
-            if ref[0]:
-                csx //= 2
-            if ref[1]:
-                csy //= 2
-            if ref[2]:
-                csz //= 2
+            max_sol = max(max_sol, sol)
+            sum_abs_sol += sol
+            sum_sq_sol += sol * sol
+            n_voxels += 1
 
-            num_children = 1 << ref.count()
-            child_desc = desc_i + 1
-            child_entries = []
-            for child_idx in range(num_children):
-                cox, coy, coz = ox, oy, oz
-                local_bit = 0
-                for d in range(3):
-                    if ref[d]:
-                        if (child_idx >> local_bit) & 1:
-                            if d == 0:
-                                cox += csx
-                            elif d == 1:
-                                coy += csy
-                            else:
-                                coz += csz
-                        local_bit += 1
-                child_entries.append((child_desc, cox, coy, coz, csx, csy, csz))
-                child_desc = int(subtree_end[child_desc])
-            for entry in reversed(child_entries):
-                stack.append(entry)
-
-        # Function-space norms (volume-weighted, normalized by domain volume |Ω|):
-        #   L_inf = max_x |e(x)|
-        #   L1    = (1/|Ω|) * integral |e| dΩ  =  (1/N) * sum_i |e_i|
-        #   L2    = sqrt( (1/|Ω|) * integral |e|^2 dΩ )  =  sqrt( (1/N) * sum_i |e_i|^2 )
-        # Each voxel has equal volume |Ω|/N, so per-voxel summation is volume-weighted.
         row["Linf_error"] = max_err
         row["L1_error"] = sum_abs_err / n_voxels if n_voxels else 0.0
         row["L2_error"] = (sum_sq_err / n_voxels) ** 0.5 if n_voxels else 0.0
@@ -692,22 +654,8 @@ def process_sweep_threshold(
             "total_coefficients", grid.activeVoxelCount()
         )
 
-        # Reconstructed VDB file size (if present)
-        recon_vdb = None
-        for name in ("final.vdb",):
-            p = os.path.join(work_dir, name)
-            if os.path.exists(p):
-                recon_vdb = p
-                break
-        # Also check for final_thr_*.vdb or final_perm*.vdb
-        if recon_vdb is None:
-            import glob
-
-            candidates = glob.glob(os.path.join(work_dir, "final*.vdb"))
-            if candidates:
-                recon_vdb = candidates[0]
         row["vdb_recon_file_bytes"] = (
-            os.path.getsize(recon_vdb) if recon_vdb else float("nan")
+            os.path.getsize(vdb_from_omni_file) if vdb_from_omni_file else float("nan")
         )
 
         # Compression ratios
@@ -887,6 +835,7 @@ def main():
                 thr_label,
                 work_dir,
                 grid,
+                args.grid_name,
                 bbox_min,
                 per_dim_levels,
                 vdb_orig_file_bytes,

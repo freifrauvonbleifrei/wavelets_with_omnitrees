@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import math
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -577,7 +578,7 @@ def _save_stage(output_dir, basename, disc, coefficients, per_dim_levels,
           f"{n_nonbg}/{len(values)} non-background)")
 
 
-def reconstruct_final_vdb(work_dir, source_vdb_path, grid_name="density"):
+def reconstruct_final_vdb(work_dir, source_vdb_path, grid_name="density", thr_label=None):
     """Reconstruct a VDB from final_3d.bin + final_values.npy in work_dir.
 
     Copies the coordinate transform from *source_vdb_path* so the output VDB
@@ -651,8 +652,9 @@ def reconstruct_final_vdb(work_dir, source_vdb_path, grid_name="density"):
                 hi = list(out_max)
                 lo[dim] = src_bbox_max[dim] + 1
                 grid.fill(tuple(lo), tuple(hi), background, active=False)
-
-        out_path = os.path.join(work_dir, f"final_{variant}.vdb")
+        out_base = f"final_{variant}"
+        out_base += f"_thr_{thr_label}" if thr_label is not None else ""
+        out_path = os.path.join(work_dir, f"{out_base}.vdb")
         vdb.write(out_path, grids=[grid])
         desc_stats = descriptor_stats(descriptor)
         print(
@@ -715,7 +717,7 @@ def reconstruct_main():
             print(f"  thr={thr_label}: skipped (no final_3d.bin)")
             continue
         print(f"  thr={thr_label}:", end="", flush=True)
-        reconstruct_final_vdb(work_dir, args.source_vdb, grid_name=args.grid)
+        reconstruct_final_vdb(work_dir, args.source_vdb, grid_name=args.grid, thr_label=thr_label)
 
 
 def main():
