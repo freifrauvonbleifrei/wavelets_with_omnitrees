@@ -639,19 +639,6 @@ def reconstruct_final_vdb(work_dir, source_vdb_path, grid_name="density", thr_la
         )
         grid.transform = vdb.createLinearTransform(src_mat4)
 
-        # Crop to the source grid's active bounding box
-        out_min, out_max = grid.evalActiveVoxelBoundingBox()
-        for dim in range(3):
-            if out_min[dim] < src_bbox_min[dim]:
-                lo = list(out_min)
-                hi = list(out_max)
-                hi[dim] = src_bbox_min[dim] - 1
-                grid.fill(tuple(lo), tuple(hi), background, active=False)
-            if out_max[dim] > src_bbox_max[dim]:
-                lo = list(out_min)
-                hi = list(out_max)
-                lo[dim] = src_bbox_max[dim] + 1
-                grid.fill(tuple(lo), tuple(hi), background, active=False)
         out_base = f"final_{variant}"
         out_base += f"_thr_{thr_label}" if thr_label is not None else ""
         out_path = os.path.join(work_dir, f"{out_base}.vdb")
