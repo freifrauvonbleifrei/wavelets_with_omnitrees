@@ -562,7 +562,25 @@ def reverse_downsplit_coefficients(
         t2_global = _subset_local_to_global_bits(t2, absorbed_dims)
         for j in range(n_parent_children):
             idx = _subset_index_in_ref(t2_global, per_child_ref[j])
-            raw_fibers[j, t2] = float(children_coeffs[j][idx])
+            try:
+                raw_fibers[j, t2] = float(children_coeffs[j][idx])
+            except IndexError as e:
+                ic(
+                    parent_coeffs,
+                    parent_ref,
+                    children_coeffs,
+                    children_refs,
+                    absorbed_dims,
+                )
+                ic(
+                    j,
+                    per_child_ref[j],
+                    absorbed_dims,
+                    t2_global,
+                    t2,
+                    idx,
+                )
+                raise e
 
     fibers = hierarchization_matrix(k_parent) @ raw_fibers
     fibers[:, 0] = np.asarray(parent_coeffs, dtype=np.float64)
@@ -1149,13 +1167,20 @@ def compress_by_downsplit_coarsening(
                 absorbed_dims = common_child_ref & ~parent_ref
                 merged_ref = parent_ref | absorbed_dims
 
-                merged_coeffs, split_children = reverse_downsplit_coefficients(
-                    coefficients[parent_hi],
-                    parent_ref,
-                    [coefficients[ci] for ci in children_hi],
-                    child_refs,
-                    absorbed_dims,
-                )
+                try:
+                    merged_coeffs, split_children = reverse_downsplit_coefficients(
+                        coefficients[parent_hi],
+                        parent_ref,
+                        [coefficients[ci] for ci in children_hi],
+                        child_refs,
+                        absorbed_dims,
+                    )
+                except Exception as e:
+                    ic(parent_hi, children_hi,violation_map, leaf_violations, level_transforms)
+                    discretization.descriptor.to_file("violations_fail")
+                    ic(str(i) + ": " + str(c) for (i, c) in enumerate(coefficients))
+                    np.save(str("violations_fail_values.npy"), coefficients)
+                    raise e
                 child_map = {}
                 for idx, ci in enumerate(children_hi):
                     remaining = child_refs[idx].copy()
