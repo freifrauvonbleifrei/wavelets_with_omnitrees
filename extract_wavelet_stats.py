@@ -562,7 +562,7 @@ def process_sweep_threshold(
             "can",
             "part00000_can_3d.bin",
             "part00000_values_can.npy",
-            "final_can_thr_{thr_label}.vdb",
+            f"final_can_thr_{thr_label}.vdb",
         ),
         ("ds", "final_3d.bin", "final_values.npy", f"final_ds_thr_{thr_label}.vdb"),
     ):
