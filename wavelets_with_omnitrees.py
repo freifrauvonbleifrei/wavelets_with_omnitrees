@@ -452,7 +452,7 @@ def _coarsening_round(
             np.asarray(coefficients[first_found], dtype=np.float64),
             sorted(delete_indices),
         )
-        if __debug__ and len(new_coefficients[new_index]) != expected_len:
+        if len(new_coefficients[new_index]) != expected_len:
             raise ValueError(
                 f"Coefficient length mismatch at new index {new_index}: "
                 f"got {len(new_coefficients[new_index])}, expected {expected_len}"
