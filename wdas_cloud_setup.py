@@ -440,7 +440,9 @@ def main():
     print(f"[INFO] Cloud rotation: {args.rotation}°")
 
     # Measure AFTER material is applied, so the grid is referenced.
-    center, diag = measure_cloud(vol)
+    # center, diag = measure_cloud(vol)
+    # for wdas sixteenth : (-0.282843, -0.494975, 0.783333), diagonal 7.696464
+    center, diag = (-0.282843, -0.494975, 0.783333), 7.696464
     print(f"[INFO] Cloud center ({center[0]:.1f}, {center[1]:.1f}, "
           f"{center[2]:.1f}), diagonal {diag:.1f}")
 

@@ -20,8 +20,7 @@ run_one_serial() {
     local LOG="$BASE_DIR/serial_log_${THR}.txt"
 
     if [ ! -d "$WORK_DIR" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP  threshold=$THR (no work-dir $WORK_DIR)" | tee -a "$MASTER_LOG"
-        return 0
+        mkdir -p "$WORK_DIR"
     fi
     if [ -f "$WORK_DIR/final_3d.bin" ] && [ -f "$WORK_DIR/final_values.npy" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') SKIP  threshold=$THR (final already exists)" | tee -a "$MASTER_LOG"
