@@ -91,7 +91,7 @@ def create_volume_material():
     return mat
 
 
-def fit_camera(vol_obj, bbox=None):
+def fit_camera(vol_obj, bbox=((-66, -21, -90), (59, 64, 63))):
     """Fit camera to the volume's bounding box.
 
     If *bbox* is given as ((min_x,min_y,min_z),(max_x,max_y,max_z)) it is
