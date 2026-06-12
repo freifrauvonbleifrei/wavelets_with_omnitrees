@@ -853,6 +853,7 @@ def main():
         sweep_csv = args.csv.rsplit(".", 1)[0] + "_sweep.csv"
         df = pd.DataFrame(rows)
         df = df.reindex(columns=SWEEP_COLUMNS)
+        df.sort_values("threshold", inplace=True, ascending=False)
         df.to_csv(sweep_csv, index=False)
         print(f"\nSweep results in: {sweep_csv}")
 
