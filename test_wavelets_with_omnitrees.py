@@ -87,7 +87,7 @@ def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
         coarsening_threshold=coarsening_threshold,
     )
     sum_discarded = can_discarded + pd_discarded
-    return disc_can, coeff_can, disc_pd, coeff_pd, sum_discarded
+    return disc_can, coeff_can, disc_pd, coeff_pd, root_scaling, sum_discarded
 
 
 def _build_disc_from_descriptor_string(dim, descriptor_string):
@@ -321,7 +321,7 @@ def test_2d_insufficient_downsplit(case):
         dyada.discretization_to_2d_ascii(disc) == case["ascii_init"]
     ), f"{label}: init ascii mismatch"
 
-    disc_can, coeff_can, disc_pd, coeff_pd, _ = _compress_pipeline(disc, nodal)
+    disc_can, coeff_can, disc_pd, coeff_pd, _, _ = _compress_pipeline(disc, nodal)
 
     assert (
         len(disc_can) == case["can_boxes"]
@@ -365,7 +365,7 @@ _________
     labels_before = [str(int(v)) for v in nodal]
     _plot_tikz(disc, labels_before, "before_pd")
 
-    disc_can, coeff_can, disc_pd, coeff_pd, _ = _compress_pipeline(disc, nodal)
+    disc_can, coeff_can, disc_pd, coeff_pd, _ , _ = _compress_pipeline(disc, nodal)
 
     # Canonical coarsening does not change anything
     assert len(disc_can) == 5
@@ -393,7 +393,7 @@ def test_3d_compresses_beyond_downsplit():
     nodal = np.array([0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=np.float64)
     assert len(disc) == 16
 
-    disc_can, coeff_can, disc_pd, coeff_pd, _ = _compress_pipeline(disc, nodal)
+    disc_can, coeff_can, disc_pd, coeff_pd, _, _ = _compress_pipeline(disc, nodal)
 
     # Canonical coarsening reduces 16 → 13
     assert len(disc_can) == 13
@@ -636,7 +636,7 @@ class TestReconstructFromFile:
 
     def test_downsplit_from_loaded_canonical_2d(self):
         dim, level = 2, 3
-        disc_can, coeff_can, disc_pd, coeff_pd, _ = _full_pipeline(
+        disc_can, coeff_can, disc_pd, coeff_pd, _, _ = _full_pipeline(
             dim, level, _sphere_fn
         )
 
@@ -958,9 +958,9 @@ def test_wavelet_compression_randomized():
     """Randomized stress test: 3D level-3 full grid with random values."""
     rng = np.random.default_rng()
     dim = 3
-    level = np.array([2, 3, 3])
+    level = np.array([2, 3, 3], dtype=np.int_)
     try:
-        for iteration in range(100):
+        for iteration in range(10000):
             disc = dyada.discretization.Discretization(
                 dyada.linearization.MortonOrderLinearization(),
                 dyada.descriptor.RefinementDescriptor(dim, level),
@@ -968,32 +968,34 @@ def test_wavelet_compression_randomized():
             nodal = rng.standard_normal(len(disc))
 
             for coarsening_threshold in (1e-1, 4e-1, 6e-1):
-                disc_can, coeff_can, disc_pd, coeff_pd, sum_discarded = _compress_pipeline(
+                disc_can, coeff_can, disc_ds, coeff_ds, root_scaling, sum_discarded = _compress_pipeline(
                     disc, nodal, coarsening_threshold=coarsening_threshold
                 )
                 # reconstruct leaf coefficients
+                coeff_can[0][0] = root_scaling
+                coeff_ds[0][0] = root_scaling
                 leaf_coeffs_can = get_leaf_scalings(disc_can, coeff_can)
-                leaf_coeffs_pd = get_leaf_scalings(disc_pd, coeff_pd)
-
+                leaf_coeffs_ds = get_leaf_scalings(disc_ds, coeff_ds)
+                # print(coeff_can, leaf_coeffs_can)
                 # check invariants:
                 # number of leaf nodal coefficients = length of discretization
                 assert len(disc_can) == len(leaf_coeffs_can)
-                assert len(disc_pd) == len(leaf_coeffs_pd)
+                assert len(disc_ds) == len(leaf_coeffs_ds)
                 # all leaf coefficients are finite (no NaN or inf)
                 assert np.all(np.isfinite(leaf_coeffs_can))
-                assert np.all(np.isfinite(leaf_coeffs_pd))
+                assert np.all(np.isfinite(leaf_coeffs_ds))
                 # L1 error of downsplit reconstruction is at most the discarded l1
                 refined_to_original_disc, refined_to_original_coeffs = _refine_to_original(
-                    level, disc_pd, leaf_coeffs_pd
+                    level, disc_ds, leaf_coeffs_ds
                 )
-                l1_diff = np.sum(np.abs(refined_to_original_coeffs - nodal)) / len(nodal)
+                l1_diff = np.mean(np.abs(refined_to_original_coeffs - nodal))
                 assert l1_diff <= sum_discarded + 1e-12, (
                     f"L1 error {l1_diff:.6e} exceeds discarded L1 {sum_discarded:.6e} "
                     f"for coarsening_threshold={coarsening_threshold}"
                 )
                 nodal_l1 = np.mean(np.abs(nodal))
-                print(len(disc_can), len(disc_pd), f"{sum_discarded:.4e}, {l1_diff / nodal_l1 : .4e}")
-                if l1_diff > nodal_l1:
+                print(len(disc_can), len(disc_ds), f"{sum_discarded:.4e}, {l1_diff / nodal_l1 : .4e}")
+                if l1_diff > nodal_l1 + 1e-12:
                     raise ValueError(
                         f"Reconstruction error {l1_diff:.6e} exceeds mean nodal value {nodal_l1:.6e}"
                     )
