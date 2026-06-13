@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import numpy.typing as npt
 from icecream import ic
 import pytest
 import random
@@ -32,7 +33,6 @@ from compare_openvdb_vs_wavelet_omnitrees import (
     _hierarchize_on_tree,
     _load_discretization,
 )
-
 
 def test_get_numbers_with_ith_bit_set():
     assert list(get_numbers_with_ith_bit_set(0, 3)) == [4, 5, 6, 7]
@@ -76,17 +76,18 @@ def _compress_pipeline(disc, nodal, coarsening_threshold=0.0):
     for c in coefficients:
         c[0] = np.nan
     coefficients[0][0] = root_scaling
-    disc_can, coeff_can, _ = compress_by_omnitree_coarsening(
+    disc_can, coeff_can, can_discarded = compress_by_omnitree_coarsening(
         disc,
         [list(c) for c in coefficients],
         coarsening_threshold=coarsening_threshold,
     )
-    disc_pd, coeff_pd, _ = compress_by_downsplit_coarsening(
+    disc_pd, coeff_pd, pd_discarded = compress_by_downsplit_coarsening(
         disc_can,
         [list(c) for c in coeff_can],
         coarsening_threshold=coarsening_threshold,
     )
-    return disc_can, coeff_can, disc_pd, coeff_pd
+    sum_discarded = can_discarded + pd_discarded
+    return disc_can, coeff_can, disc_pd, coeff_pd, sum_discarded
 
 
 def _build_disc_from_descriptor_string(dim, descriptor_string):
@@ -320,7 +321,7 @@ def test_2d_insufficient_downsplit(case):
         dyada.discretization_to_2d_ascii(disc) == case["ascii_init"]
     ), f"{label}: init ascii mismatch"
 
-    disc_can, coeff_can, disc_pd, coeff_pd = _compress_pipeline(disc, nodal)
+    disc_can, coeff_can, disc_pd, coeff_pd, _ = _compress_pipeline(disc, nodal)
 
     assert (
         len(disc_can) == case["can_boxes"]
@@ -364,7 +365,7 @@ _________
     labels_before = [str(int(v)) for v in nodal]
     _plot_tikz(disc, labels_before, "before_pd")
 
-    disc_can, coeff_can, disc_pd, coeff_pd = _compress_pipeline(disc, nodal)
+    disc_can, coeff_can, disc_pd, coeff_pd, _ = _compress_pipeline(disc, nodal)
 
     # Canonical coarsening does not change anything
     assert len(disc_can) == 5
@@ -392,7 +393,7 @@ def test_3d_compresses_beyond_downsplit():
     nodal = np.array([0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1], dtype=np.float64)
     assert len(disc) == 16
 
-    disc_can, coeff_can, disc_pd, coeff_pd = _compress_pipeline(disc, nodal)
+    disc_can, coeff_can, disc_pd, coeff_pd, _ = _compress_pipeline(disc, nodal)
 
     # Canonical coarsening reduces 16 → 13
     assert len(disc_can) == 13
@@ -635,7 +636,9 @@ class TestReconstructFromFile:
 
     def test_downsplit_from_loaded_canonical_2d(self):
         dim, level = 2, 3
-        disc_can, coeff_can, disc_pd, coeff_pd = _full_pipeline(dim, level, _sphere_fn)
+        disc_can, coeff_can, disc_pd, coeff_pd, _ = _full_pipeline(
+            dim, level, _sphere_fn
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             disc_can.descriptor.to_file(str(Path(tmp) / "can"))
@@ -863,8 +866,23 @@ def test_decomposed_and_batched_downsplit_diverge_on_random_binary():
         dyada.linearization.MortonOrderLinearization(), desc
     )
     nodal = np.array(
-        [1, 0, 0, 1, 1, 1, 0,      # collapsed octants 0..6
-         1, 1, 1, 1, 1, 1, 1, 1],  # octant 7's 8 original values (all 1)
+        [
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,  # collapsed octants 0..6
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+        ],  # octant 7's 8 original values (all 1)
         dtype=np.float64,
     )
     assert len(nodal) == len(disc) == 15
@@ -893,3 +911,93 @@ def test_decomposed_and_batched_downsplit_diverge_on_random_binary():
     for d, c in [(d_batched, c_batched), (d_decomp, c_decomp)]:
         raster = get_resampled_image(d, get_leaf_scalings(d, c), target_level)
         np.testing.assert_array_equal(raster, raster_orig)
+
+def _refine_to_original(
+    level: npt.NDArray[np.int_],
+    discretization: dyada.discretization.Discretization,
+    leaf_coefficients: npt.NDArray[np.float64],
+):
+    # Refine the compressed tree back to the original full grid, filling in leaf coefficients
+    # (through mapping from the compressed tree's leaf coefficients)
+    # and returning the refined leaf coefficients.
+    plan = dyada.refinement.PlannedAdaptiveRefinement(discretization)
+    box_index = -1
+    for current_branch, refinement in dyada.descriptor.branch_generator(
+        discretization.descriptor
+    ):
+        if refinement.count() == 0:
+            box_index += 1
+            # leaf node: check level
+            level_difference = level - dyada.descriptor.get_level_from_branch(
+                current_branch
+            )
+            if np.any(level_difference < 0):
+                raise ValueError(
+                    f"Compressed tree has a leaf at level \
+                    {dyada.descriptor.get_level_from_branch(current_branch)}, \
+                    which is deeper than the original level {level}"
+                )
+            if np.any(level_difference > 0):
+                # refine to original level
+                plan.plan_refinement(box_index, level_difference)
+
+    new_disc, coeff_mapping = plan.apply_refinements()
+    refined_leaf_coefficients = np.empty(len(new_disc), dtype=np.float64)
+    for old_idx, new_indices in enumerate(coeff_mapping):
+        for new_idx in new_indices:
+            refined_leaf_coefficients[new_idx] = leaf_coefficients[old_idx]
+    normalized_disc, _, num_rounds = dyada.refinement.normalize_discretization(
+        new_disc, track_mapping="boxes"
+    )
+    if num_rounds > 0:
+        raise ValueError("Normalization changed the discretization")
+    return new_disc, refined_leaf_coefficients
+
+
+def test_wavelet_compression_randomized():
+    """Randomized stress test: 3D level-3 full grid with random values."""
+    rng = np.random.default_rng()
+    dim = 3
+    level = np.array([2, 3, 3])
+    try:
+        for iteration in range(100):
+            disc = dyada.discretization.Discretization(
+                dyada.linearization.MortonOrderLinearization(),
+                dyada.descriptor.RefinementDescriptor(dim, level),
+            )
+            nodal = rng.standard_normal(len(disc))
+
+            for coarsening_threshold in (1e-1, 4e-1, 6e-1):
+                disc_can, coeff_can, disc_pd, coeff_pd, sum_discarded = _compress_pipeline(
+                    disc, nodal, coarsening_threshold=coarsening_threshold
+                )
+                # reconstruct leaf coefficients
+                leaf_coeffs_can = get_leaf_scalings(disc_can, coeff_can)
+                leaf_coeffs_pd = get_leaf_scalings(disc_pd, coeff_pd)
+
+                # check invariants:
+                # number of leaf nodal coefficients = length of discretization
+                assert len(disc_can) == len(leaf_coeffs_can)
+                assert len(disc_pd) == len(leaf_coeffs_pd)
+                # all leaf coefficients are finite (no NaN or inf)
+                assert np.all(np.isfinite(leaf_coeffs_can))
+                assert np.all(np.isfinite(leaf_coeffs_pd))
+                # L1 error of downsplit reconstruction is at most the discarded l1
+                refined_to_original_disc, refined_to_original_coeffs = _refine_to_original(
+                    level, disc_pd, leaf_coeffs_pd
+                )
+                l1_diff = np.sum(np.abs(refined_to_original_coeffs - nodal)) / len(nodal)
+                assert l1_diff <= sum_discarded + 1e-12, (
+                    f"L1 error {l1_diff:.6e} exceeds discarded L1 {sum_discarded:.6e} "
+                    f"for coarsening_threshold={coarsening_threshold}"
+                )
+                nodal_l1 = np.mean(np.abs(nodal))
+                print(len(disc_can), len(disc_pd), f"{sum_discarded:.4e}, {l1_diff / nodal_l1 : .4e}")
+                if l1_diff > nodal_l1:
+                    raise ValueError(
+                        f"Reconstruction error {l1_diff:.6e} exceeds mean nodal value {nodal_l1:.6e}"
+                    )
+    except Exception as e:
+        print(f"Test failed on iteration {iteration} with seed {rng.bit_generator.state['state']}")
+        print(f"Nodal values: {nodal}")
+        raise e
