@@ -352,12 +352,12 @@ def _coarsening_round(
     p = dyada.refinement.PlannedAdaptiveRefinement(discretization)
     planned_any = False
     round_discarded_l1 = 0.0
-    descriptor = discretization.descriptor
-    node_levels = _compute_node_levels(descriptor, base_level=base_level)
+    init_descriptor = discretization.descriptor
+    node_levels = _compute_node_levels(init_descriptor, base_level=base_level)
 
     stack: list[int] = []
-    desc_i = len(descriptor) - 1
-    for current_ref in reversed(descriptor):
+    desc_i = len(init_descriptor) - 1
+    for current_ref in reversed(init_descriptor):
         k = current_ref.count()
         if k == 0:
             stack.append(desc_i)
@@ -404,16 +404,16 @@ def _coarsening_round(
     if not planned_any:
         return discretization, coefficients, False, 0.0
 
-    old_disc = discretization
     discretization, mapping = p.apply_refinements(
-        track_mapping="patches", sweep_mode="canonical"
+        track_mapping="patches", sweep_mode="as_planned"
     )
+    coarse_descriptor = discretization.descriptor
     final_markers = p._markers
     if __debug__:
-        dyada.descriptor.validate_descriptor(discretization.descriptor)
+        dyada.descriptor.validate_descriptor(coarse_descriptor)
 
     new_coefficients: list[Optional[np.ndarray]] = [None] * len(
-        discretization.descriptor
+        coarse_descriptor
     )
     inverted_mapping: dict[int, set[int]] = {}
     for old_index, mapped_to in enumerate(mapping):
@@ -421,7 +421,7 @@ def _coarsening_round(
             inverted_mapping.setdefault(new_index, set()).add(old_index)
 
     for new_index, mapped_from in inverted_mapping.items():
-        expected_num_ref = discretization.descriptor[new_index].count()
+        expected_num_ref = coarse_descriptor[new_index].count()
         expected_len = 1 if expected_num_ref == 0 else (1 << expected_num_ref)
         mapped_from_sorted = sorted(mapped_from)
         matching = [
@@ -437,9 +437,9 @@ def _coarsening_round(
         if not np.any(marker < 0):
             continue
         refined_dimensions_desc = get_refined_dimensions_desc(
-            old_disc.descriptor[first_found]
+            init_descriptor[first_found]
         )
-        num_ref = old_disc.descriptor[first_found].count()
+        num_ref = init_descriptor[first_found].count()
         delete_indices: set[int] = set()
         for d_i in range(num_dimensions):
             if marker[d_i] >= 0:
